@@ -153,21 +153,23 @@ fn decode_inner(engine: &Engine, input: &str, cfg: &EngineConfig, predict: bool)
     // 3. combine sequentially (bounded best-first).
     let mut combined = combine(engine, chunk_lists, cfg);
 
-    // 3b. Whole-input literal/English passthrough demotion. When a Chinese reading covers the ENTIRE
+    // 3b. 4-gram N-best RESCORING (convert only). When `fourgram.fst` is loaded, recompute the LM
+    // portion of each retained candidate's TOTAL cost with the 4-gram model (4→3→2→1 stupid-backoff)
+    // and re-sort. Inert (no-op) when the 4-gram model is absent, so there is no regression without
+    // the file. This only REORDERS the existing N-best — non-LM costs are untouched — so latency
+    // stays flat (a few hundred fst lookups). MUST run BEFORE the literal demotion below, so the
+    // literal is demoted relative to the FINAL (4-gram-adjusted) Chinese score; otherwise a 4-gram
+    // that raises the best Chinese path's cost can let the already-demoted literal flip back to #1.
+    if !predict && engine.lm.has_fourgram() {
+        rescore_fourgram(engine, &mut combined);
+    }
+
+    // 3c. Whole-input literal/English passthrough demotion. When a Chinese reading covers the ENTIRE
     // input (no leftover latin) AND is high quality, the opaque whole-input literal must not rank #1.
     // This generalizes the clean-pinyin `fully_segments` demotion to typo/fuzzy/abbrev-corrected
     // inputs, which do not segment as exact pinyin but still have a full Chinese reading.
     if !predict {
         demote_full_input_literal(input, &mut combined);
-    }
-
-    // 3c. 4-gram N-best RESCORING (convert only). When `fourgram.fst` is loaded, recompute the LM
-    // portion of each retained candidate's TOTAL cost with the 4-gram model (4→3→2→1 stupid-backoff)
-    // and re-sort. Inert (no-op) when the 4-gram model is absent, so there is no regression without
-    // the file. This only REORDERS the existing N-best — non-LM costs are untouched — so latency
-    // stays flat (a few hundred fst lookups).
-    if !predict && engine.lm.has_fourgram() {
-        rescore_fourgram(engine, &mut combined);
     }
 
     // 4. to Candidate, sorted, truncated.
@@ -1000,7 +1002,7 @@ fn beam_search(
         // trigram top-K but wins after the 4-gram upgrade). Reconstruction allocates strings, so this
         // is bounded — the extra cap is small and only taken on the (already cheaper) 4-gram path.
         let recon_cap = if engine.lm.has_fourgram() {
-            (cfg.max_candidates * 5).max(width)
+            (cfg.max_candidates * 4).max(width)
         } else {
             (cfg.max_candidates * 3).max(width)
         };
@@ -1093,7 +1095,7 @@ fn combine(engine: &Engine, lists: Vec<Vec<Partial>>, cfg: &EngineConfig) -> Vec
     // Widen the retained product modestly when 4-gram rescoring is active so the gold path is more
     // likely to be in the N-best that gets re-ranked. Bounded so latency stays flat.
     let cap = if want_chain {
-        (cfg.max_candidates * 5).max(cfg.beam_width)
+        (cfg.max_candidates * 4).max(cfg.beam_width)
     } else {
         (cfg.max_candidates * 3).max(cfg.beam_width)
     };

@@ -37,16 +37,18 @@ input ─▶ normalize ─▶ syllable lattice ─▶ word lattice (FST walk) �
   (`ni'hao`), memory-mapped, walked by a custom automaton/lattice walk supporting fuzzy,
   abbreviation-by-initials (incl. matching a whole multi-syllable word's reading by its
   initials), and interleaved English sub-spans for mixed input.
-- **Language model** (`lm.rs`): word **unigram + bigram + trigram** with **stupid-backoff**.
+- **Language model** (`lm.rs`): word **unigram + bigram + trigram (+ 4-gram rescoring)** with **stupid-backoff**.
   Costs are the **signed log-ratio of the conditional over the unigram**
   (`-500·ln[P(w₃|ctx)/P(w₃)]`) estimated with **absolute-discounting interpolation**
   (modified-Kneser-Ney style), so the trigram *refines* the bigram on one comparable scale
   instead of overpowering it. Trigram/bigram tables are `fst::Map`s (mmap), unigram is in the
   word table.
 - **Decoder** (`decoder.rs`): **trigram beam search**, state `(position, w_prev, w_prevprev)`,
-  per-state N-best diversity for rich candidates; English/mixed handled with length-scaled
-  passthrough costs, and a full-coverage demotion so a corrected Chinese reading outranks the
-  raw literal (while the literal stays in the list).
+  per-state N-best diversity for rich candidates, then a **4-gram N-best rescoring pass** that
+  upgrades only the LM term of each retained path (4→3→2→1 backoff) and re-sorts — keeping the
+  beam state small and latency flat. English/mixed handled with length-scaled passthrough costs,
+  and a full-coverage demotion (applied AFTER rescoring) so a corrected Chinese reading outranks
+  the raw literal (while the literal stays in the list).
 
 ### Crates
 - `pyime-core` — the engine (no network, mmap'd data).
@@ -74,7 +76,7 @@ Built entirely from **freely-available, GitHub-hosted** sources (see `data/meta.
   lexicon, smoothed with absolute-discounting interpolation.
 - **English** — a frequency-ranked list (`google-10000-english` ∪ `dwyl/english-words`, 60k).
 
-Counts: ~700k words / ~583k readings / ~734k bigrams / ~49k trigrams / 60k English.
+Counts: ~700k words / ~583k readings / ~734k bigrams / ~49k trigrams / ~19k 4-grams / 60k English.
 
 **Footprint:** release binary **~3 MB** + `data/` **~49 MB** = **~52 MB total**, well under the
 100 MB budget (data is mmap'd separately, not embedded).
@@ -125,17 +127,17 @@ and on-disk data size. Output is a human-readable table **and** `report.json`.
 ```
 bucket              n    top1    top5   top10     mrr char_acc     cer coverage
 -------------------------------------------------------------------------------
-full              600   0.613   0.820   0.862   0.705    0.896   0.104    0.875
+full              600   0.627   0.813   0.862   0.710    0.894   0.106    0.875
 abbr              599   0.092   0.235   0.307   0.155    0.145   0.855    0.387
-fuzzy             600   0.510   0.713   0.768   0.600    0.857   0.143    0.803
-typo              600   0.323   0.445   0.477   0.370    0.753   0.247    0.513
+fuzzy             600   0.517   0.712   0.768   0.604    0.855   0.145    0.803
+typo              600   0.327   0.443   0.477   0.371    0.749   0.251    0.513
 english            40   1.000   1.000   1.000   1.000    1.000   0.000    1.000
 mixed             257   0.658   0.802   0.829   0.720    0.885   0.115    0.837
-long_sentence     600   0.583   0.792   0.833   0.674    0.913   0.087    0.848
+long_sentence     600   0.593   0.785   0.832   0.678    0.910   0.090    0.848
 short_word        111   0.748   0.937   0.982   0.827    0.811   0.189    0.982
 -------------------------------------------------------------------------------
-OVERALL          3407   0.459   0.632   0.678   0.534    0.732   0.268    0.710
-Latency: p50 7.5ms  p95 18.1ms   |   RSS 37 MiB   |   data 49 MiB
+OVERALL          3407   0.465   0.629   0.678   0.536    0.730   0.270    0.710
+Latency: p50 9.4ms  p95 22.7ms   |   RSS 38 MiB   |   data 50 MiB
 ```
 
 ### How it got there — quantified improvement per stage
@@ -153,7 +155,8 @@ The engine was tuned **using the eval harness as the objective function**. OVERA
 | **smoothed trigram LM** | 0.414 | 0.620 | 0.695 | 0.610 | the big lever |
 | **literal-demotion** | 0.460 | 0.620 | 0.695 | 0.612 | typo 0.10→0.33 |
 | **简拼 word-boost** | 0.463 | 0.621 | 0.698 | 0.612 | kyi→可以, bj→北京 #1 |
-| **繁→简归一化** | **0.459** | **0.632** | **0.710** | **0.613** | OpenCC T2S; top5/coverage up |
+| **繁→简归一化** | 0.459 | 0.632 | 0.710 | 0.613 | OpenCC T2S; top5/coverage up |
+| **4-gram rescoring** | **0.465** | **0.629** | **0.710** | **0.627** | full/long-sentence top1 up |
 
 The two dominant levers were the **curated lexicon** (correct readings) and the **smoothed
 trigram LM** — exactly as in commercial systems. On the controlled A/B over the 980 sentences

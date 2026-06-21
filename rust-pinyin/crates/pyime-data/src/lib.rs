@@ -78,6 +78,18 @@ const BIGRAM_MIN_COUNT: u32 = 5;
 /// smoothing keeps rare triples from overfitting, so we can afford a moderate floor (raising it
 /// further only loses recall); the log-ratio formulation is what actually tames the noise.
 const TRIGRAM_MIN_COUNT: u32 = 8;
+/// Drop word-4-gram quadruples observed fewer than this many times. 4-grams explode
+/// combinatorially and are far sparser than trigrams, so we use a noticeably higher floor than the
+/// trigram: most 4-grams seen 1–5 times are corpus-specific noise. This keeps `fourgram.fst` small
+/// (well within the 80 MB total budget) while retaining the genuinely-repeated long contexts.
+/// Tuned to 7, deliberately ONE ABOVE `SHOPPING_WEIGHT` (6): a 4-gram seen exactly once in the
+/// in-domain shopping corpus contributes weight 6, so a floor of 7 excludes single-shopping-
+/// occurrence 4-grams (the noisiest, most overfit tier — there is a huge count==6 spike of them)
+/// while keeping any 4-gram with a genuine *second* observation (or ≥7 general-corpus hits). This
+/// mirrors the trigram floor sitting just above the single-occurrence tier. Empirically the count
+/// distribution has a cliff at 6: floor 6 → ~466k quads / ~9.4 MB FST, floor 7 → ~19k quads /
+/// ~0.46 MB FST (total ~51 MB). 7 captures the repeated long contexts without the single-obs noise.
+const FOURGRAM_MIN_COUNT: u32 = 7;
 
 /// Absolute-discounting constant `D` for the **bigram** model `P(w3|w2)`. Subtracted from each
 /// observed count; the freed mass is redistributed to the unigram via interpolation. ~0.75 is the
@@ -85,6 +97,10 @@ const TRIGRAM_MIN_COUNT: u32 = 8;
 const BIGRAM_DISCOUNT: f64 = 0.75;
 /// Absolute-discounting constant `D` for the **trigram** model `P(w3|w1,w2)` (back-off to bigram).
 const TRIGRAM_DISCOUNT: f64 = 1.0;
+/// Absolute-discounting constant `D` for the **4-gram** model `P(w3|w0,w1,w2)` (back-off to the
+/// smoothed trigram). Same value as the trigram order: 4-gram counts are small, so a full-unit
+/// discount keeps the higher-order term from overfitting the few contexts that survive pruning.
+const FOURGRAM_DISCOUNT: f64 = 1.0;
 /// Clamp for the SIGNED log-ratio LM costs (transition = `-500·ln[P(w|ctx)/P(w)]`). The ratio is
 /// bounded both ways: a hugely-boosted n-gram cannot drop the path by more than this, and a
 /// suppressed one cannot inflate it past this. Keeps stored costs in a sane band and the beam
@@ -94,6 +110,10 @@ const LM_COST_CLAMP: i32 = 12_000;
 const MAX_BIGRAMS: usize = 2_500_000;
 /// Hard cap on the number of trigram triples kept (highest-count first).
 const MAX_TRIGRAMS: usize = 3_000_000;
+/// Hard cap on the number of 4-gram quadruples kept (highest-count first). Capped lower than the
+/// trigram so the 16-byte-key FST stays small and the total `data/` size remains well under the
+/// 80 MB budget. ~1.5M keys at 16 bytes + value is a few MB of FST after compression.
+const MAX_FOURGRAMS: usize = 1_500_000;
 /// Weight (count multiplier) applied to the in-domain shopping corpus when training
 /// the LM (the general corpus is much larger; this keeps the in-domain signal alive).
 const SHOPPING_WEIGHT: u32 = 6;
@@ -327,9 +347,9 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
     // helper file: data/word_pinyin.tsv — every word + canonical reading.
     write_word_pinyin_tsv(out_dir, &words).context("write word_pinyin.tsv")?;
 
-    // --- 5. Build + emit bigram.fst + trigram.fst ---------------------------
-    eprintln!("[5/8] building bigram + trigram LM ...");
-    let (num_bigrams, num_trigrams, heldout) = build_and_write_ngrams(
+    // --- 5. Build + emit bigram.fst + trigram.fst + fourgram.fst ------------
+    eprintln!("[5/8] building bigram + trigram + 4-gram LM ...");
+    let (num_bigrams, num_trigrams, num_fourgrams, heldout) = build_and_write_ngrams(
         out_dir,
         &words,
         &opencc,
@@ -337,7 +357,7 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
         corpus_csv.as_deref(),
     )?;
     eprintln!(
-        "  bigrams kept: {num_bigrams}  trigrams kept: {num_trigrams}  heldout: {}",
+        "  bigrams kept: {num_bigrams}  trigrams kept: {num_trigrams}  fourgrams kept: {num_fourgrams}  heldout: {}",
         heldout.len()
     );
 
@@ -355,7 +375,11 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
     let source_notes = format!(
         "rime-ice(base/8105/41448/others/tencent) + rime-essay + jieba-dict back-fill \
          + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words \
-         + google-10000-english + toutiao-news-titles + online-shopping; {}",
+         + google-10000-english + toutiao-news-titles + online-shopping; \
+         LM=word bi/tri/4-gram over toutiao+shopping (longest-match tokenization, T->S normalized), \
+         absolute-discounting interpolation (bi D={BIGRAM_DISCOUNT}, tri D={TRIGRAM_DISCOUNT}, \
+         4-gram D={FOURGRAM_DISCOUNT}), signed log-ratio costs; \
+         min-count bi={BIGRAM_MIN_COUNT}/tri={TRIGRAM_MIN_COUNT}/4-gram={FOURGRAM_MIN_COUNT}; {}",
         notes.join(", ")
     );
     write_meta(
@@ -364,6 +388,7 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
         num_readings,
         num_bigrams,
         num_trigrams,
+        num_fourgrams,
         &source_notes,
     )?;
 
@@ -727,13 +752,14 @@ fn write_word_pinyin_tsv(out_dir: &Path, words: &WordSet) -> Result<()> {
 // bigram.fst + trigram.fst
 // ===========================================================================
 
+#[allow(clippy::type_complexity)]
 fn build_and_write_ngrams(
     out_dir: &Path,
     words: &WordSet,
     opencc: &pinyin::OpenCc,
     corpus_toutiao: Option<&Path>,
     corpus_csv: Option<&Path>,
-) -> Result<(u64, u64, Vec<String>)> {
+) -> Result<(u64, u64, u64, Vec<String>)> {
     let seg = Segmenter::new(&words.surface_to_id);
     // Normalize corpus text to Simplified before segmentation so any traditional
     // text in the corpora maps onto the (simplified) vocabulary, instead of failing
@@ -749,6 +775,7 @@ fn build_and_write_ngrams(
     let mut uni_counts: FxHashMap<u32, u32> = FxHashMap::default();
     let mut bi_counts: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     let mut tri_counts: FxHashMap<(u32, u32, u32), u32> = FxHashMap::default();
+    let mut four_counts: FxHashMap<(u32, u32, u32, u32), u32> = FxHashMap::default();
     let mut heldout: Vec<String> = Vec::new();
 
     let count_sentence =
@@ -756,7 +783,8 @@ fn build_and_write_ngrams(
          weight: u32,
          uni: &mut FxHashMap<u32, u32>,
          bi: &mut FxHashMap<(u32, u32), u32>,
-         tri: &mut FxHashMap<(u32, u32, u32), u32>| {
+         tri: &mut FxHashMap<(u32, u32, u32), u32>,
+         four: &mut FxHashMap<(u32, u32, u32, u32), u32>| {
             let ids = seg.segment(s, &words.surface_to_id);
             for &id in &ids {
                 *uni.entry(id).or_insert(0) += weight;
@@ -766,6 +794,9 @@ fn build_and_write_ngrams(
             }
             for w in ids.windows(3) {
                 *tri.entry((w[0], w[1], w[2])).or_insert(0) += weight;
+            }
+            for w in ids.windows(4) {
+                *four.entry((w[0], w[1], w[2], w[3])).or_insert(0) += weight;
             }
         };
 
@@ -777,7 +808,14 @@ fn build_and_write_ngrams(
         eprintln!("  general (toutiao) sentences: {}", sentences.len());
         for s in &sentences {
             let s = t2s(s);
-            count_sentence(&s, 1, &mut uni_counts, &mut bi_counts, &mut tri_counts);
+            count_sentence(
+                &s,
+                1,
+                &mut uni_counts,
+                &mut bi_counts,
+                &mut tri_counts,
+                &mut four_counts,
+            );
         }
         used_corpus = true;
     }
@@ -804,6 +842,7 @@ fn build_and_write_ngrams(
                 &mut uni_counts,
                 &mut bi_counts,
                 &mut tri_counts,
+                &mut four_counts,
             );
         }
         used_corpus = true;
@@ -819,6 +858,7 @@ fn build_and_write_ngrams(
                     &mut uni_counts,
                     &mut bi_counts,
                     &mut tri_counts,
+                    &mut four_counts,
                 );
             }
         }
@@ -840,6 +880,12 @@ fn build_and_write_ngrams(
     for &(w1, w2, _w3) in tri_counts.keys() {
         *tri_distinct.entry((w1, w2)).or_insert(0) += 1;
     }
+    // N1+(w0,w1,w2•) = #distinct words following the context (w0,w1,w2) (4-gram continuation
+    // diversity), derived from the FULL 4-gram table before min-count pruning.
+    let mut four_distinct: FxHashMap<(u32, u32, u32), u32> = FxHashMap::default();
+    for &(w0, w1, w2, _w3) in four_counts.keys() {
+        *four_distinct.entry((w0, w1, w2)).or_insert(0) += 1;
+    }
 
     // Smoothed unigram probability P(w) = c1(w)/total.
     let uni_p = |w: u32| -> f64 {
@@ -856,6 +902,20 @@ fn build_and_write_ngrams(
         let n1 = *bi_distinct.get(&w2).unwrap_or(&0) as f64;
         let lambda = BIGRAM_DISCOUNT * n1 / c_w2;
         ((c2 - BIGRAM_DISCOUNT).max(0.0)) / c_w2 + lambda * p_uni
+    };
+    // Smoothed trigram P(w3|w1,w2) = max(c3-D,0)/c2(w1,w2) + λ(w1,w2)·P_bigram(w3|w2),
+    // with λ(w1,w2) = D·N1+(w1,w2•)/c2(w1,w2). `c3` is the raw count of (w1,w2,w3). Falls back to
+    // the smoothed bigram when the context (w1,w2) is unseen. Shared by the trigram emission below
+    // AND the 4-gram interpolation (which backs off onto this exact lower-order estimate).
+    let tri_p = |w1: u32, w2: u32, w3: u32, c3: f64| -> f64 {
+        let c2 = *bi_counts.get(&(w1, w2)).unwrap_or(&0) as f64;
+        let p_bi = bi_p(w2, w3, *bi_counts.get(&(w2, w3)).unwrap_or(&0) as f64);
+        if c2 <= 0.0 {
+            return p_bi;
+        }
+        let n1 = *tri_distinct.get(&(w1, w2)).unwrap_or(&0) as f64;
+        let lambda = TRIGRAM_DISCOUNT * n1 / c2;
+        ((c3 - TRIGRAM_DISCOUNT).max(0.0)) / c2 + lambda * p_bi
     };
 
     // --- bigram.fst (signed log-ratio: -500·ln[P(w3|w2)/P(w3)]) -------------
@@ -911,16 +971,7 @@ fn build_and_write_ngrams(
         fst::MapBuilder::new(std::io::BufWriter::new(trigram_file)).context("trigram MapBuilder")?;
     let mut n_trigrams: u64 = 0;
     for &((w1, w2, w3), count) in &triples {
-        let c2 = *bi_counts.get(&(w1, w2)).unwrap_or(&0) as f64;
-        // Lower-order term: the SMOOTHED bigram P(w3|w2) (uses the raw c2(w2,w3) count).
-        let p_bi = bi_p(w2, w3, *bi_counts.get(&(w2, w3)).unwrap_or(&0) as f64);
-        let p_cond = if c2 > 0.0 {
-            let n1 = *tri_distinct.get(&(w1, w2)).unwrap_or(&0) as f64;
-            let lambda = TRIGRAM_DISCOUNT * n1 / c2;
-            ((count as f64 - TRIGRAM_DISCOUNT).max(0.0)) / c2 + lambda * p_bi
-        } else {
-            p_bi
-        };
+        let p_cond = tri_p(w1, w2, w3, count as f64);
         let p_uni = uni_p(w3);
         let cost = log_ratio_cost(p_cond, p_uni);
         tb.insert(pyime_core::format::trigram_key(w1, w2, w3), pyime_core::lm::encode_cost(cost))
@@ -929,7 +980,54 @@ fn build_and_write_ngrams(
     }
     tb.finish().context("trigram finish")?;
 
-    Ok((n_bigrams, n_trigrams, heldout))
+    // --- fourgram.fst (signed log-ratio: -500·ln[P(w3|w0,w1,w2)/P(w3)]) ----
+    // P(w3|w0,w1,w2) = max(c4-D,0)/c3(w0,w1,w2) + λ(w0,w1,w2)·P_trigram(w3|w1,w2),
+    // with λ(w0,w1,w2) = D·N1+(w0,w1,w2•)/c3(w0,w1,w2). The 4-gram REFINES the (already smoothed)
+    // trigram on the SAME log-ratio scale — exactly one order above the trigram, mirroring how the
+    // trigram refines the bigram. `c3(w0,w1,w2)` is the raw trigram count of the context.
+    let mut quads: Vec<((u32, u32, u32, u32), u32)> = four_counts
+        .iter()
+        .filter(|&(_, &c)| c >= FOURGRAM_MIN_COUNT)
+        .map(|(&k, &c)| (k, c))
+        .collect();
+    if quads.len() > MAX_FOURGRAMS {
+        eprintln!("  pruning fourgrams {} -> {}", quads.len(), MAX_FOURGRAMS);
+        quads.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        quads.truncate(MAX_FOURGRAMS);
+    }
+    quads.sort_unstable_by_key(|&((a, b, c, d), _)| {
+        // 16-byte BE order == (a,b,c,d) lexicographic; encode into u128 for the sort key.
+        ((a as u128) << 96) | ((b as u128) << 64) | ((c as u128) << 32) | (d as u128)
+    });
+
+    let fourgram_file =
+        std::fs::File::create(out_dir.join("fourgram.fst")).context("create fourgram.fst")?;
+    let mut fb = fst::MapBuilder::new(std::io::BufWriter::new(fourgram_file))
+        .context("fourgram MapBuilder")?;
+    let mut n_fourgrams: u64 = 0;
+    for &((w0, w1, w2, w3), count) in &quads {
+        let c3 = *tri_counts.get(&(w0, w1, w2)).unwrap_or(&0) as f64;
+        // Lower-order term: the SMOOTHED trigram P(w3|w1,w2) (uses the raw c3(w1,w2,w3) count).
+        let p_tri = tri_p(w1, w2, w3, *tri_counts.get(&(w1, w2, w3)).unwrap_or(&0) as f64);
+        let p_cond = if c3 > 0.0 {
+            let n1 = *four_distinct.get(&(w0, w1, w2)).unwrap_or(&0) as f64;
+            let lambda = FOURGRAM_DISCOUNT * n1 / c3;
+            ((count as f64 - FOURGRAM_DISCOUNT).max(0.0)) / c3 + lambda * p_tri
+        } else {
+            p_tri
+        };
+        let p_uni = uni_p(w3);
+        let cost = log_ratio_cost(p_cond, p_uni);
+        fb.insert(
+            pyime_core::format::fourgram_key(w0, w1, w2, w3),
+            pyime_core::lm::encode_cost(cost),
+        )
+        .context("fourgram insert")?;
+        n_fourgrams += 1;
+    }
+    fb.finish().context("fourgram finish")?;
+
+    Ok((n_bigrams, n_trigrams, n_fourgrams, heldout))
 }
 
 /// Read review sentences from the online_shopping CSV (`cat,label,review`).
@@ -1127,6 +1225,7 @@ fn dir_data_bytes(out_dir: &Path) -> u64 {
         "postings.bin",
         "bigram.fst",
         "trigram.fst",
+        "fourgram.fst",
         "english.fst",
         "word_pinyin.tsv",
         "hanzi_pinyin.tsv",
@@ -1138,18 +1237,20 @@ fn dir_data_bytes(out_dir: &Path) -> u64 {
         .sum()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_meta(
     out_dir: &Path,
     num_words: u64,
     num_readings: u64,
     num_bigrams: u64,
     num_trigrams: u64,
+    num_fourgrams: u64,
     source_notes: &str,
 ) -> Result<()> {
     let bytes_total = dir_data_bytes(out_dir);
-    // We extend the core `Meta` JSON with an extra `num_trigrams` key. The core
+    // We extend the core `Meta` JSON with extra `num_trigrams` / `num_fourgrams` keys. The core
     // `Meta` deserializer ignores unknown fields, so this stays format-compatible
-    // while exposing the trigram count. Build the JSON object explicitly.
+    // while exposing the higher-order n-gram counts. Build the JSON object explicitly.
     let json = serde_json::json!({
         "version": pyime_core::format::FORMAT_VERSION,
         "log_base": LOG_BASE as f32,
@@ -1157,6 +1258,7 @@ fn write_meta(
         "num_readings": num_readings,
         "num_bigrams": num_bigrams,
         "num_trigrams": num_trigrams,
+        "num_fourgrams": num_fourgrams,
         "bytes_total": bytes_total,
         "source_notes": source_notes,
     });
@@ -1225,6 +1327,10 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
         .get("num_trigrams")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let meta_fourgrams = raw_meta
+        .get("num_fourgrams")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     let words_bytes = std::fs::read(out_dir.join("words.bin")).context("read words.bin")?;
     let archived = rkyv::check_archived_root::<Vec<pyime_core::format::WordEntry>>(&words_bytes)
@@ -1245,6 +1351,11 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
     let tri_bytes = std::fs::read(out_dir.join("trigram.fst")).context("read trigram.fst")?;
     let tri = Map::new(tri_bytes).context("open trigram.fst")?;
     let num_trigrams = tri.len() as u64;
+
+    // fourgram.fst (NEW)
+    let four_bytes = std::fs::read(out_dir.join("fourgram.fst")).context("read fourgram.fst")?;
+    let four = Map::new(four_bytes).context("open fourgram.fst")?;
+    let num_fourgrams = four.len() as u64;
 
     let en_bytes = std::fs::read(out_dir.join("english.fst")).context("read english.fst")?;
     let en = Set::new(en_bytes).context("open english.fst")?;
@@ -1275,6 +1386,7 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
     eprintln!("  postings.bin   : {} bytes", postings.len());
     eprintln!("  bigram.fst     : {num_bigrams} pairs (meta {})", meta.num_bigrams);
     eprintln!("  trigram.fst    : {num_trigrams} triples (meta {meta_trigrams})");
+    eprintln!("  fourgram.fst   : {num_fourgrams} quads (meta {meta_fourgrams})");
     eprintln!("  english.fst    : {num_english} terms");
     eprintln!("  word_pinyin.tsv: {wp_lines} entries");
     eprintln!("  bytes_total    : {bytes_total} ({:.2} MB)", bytes_total as f64 / 1e6);
@@ -1283,6 +1395,7 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
     anyhow::ensure!(num_readings == meta.num_readings, "readings count mismatch");
     anyhow::ensure!(num_bigrams == meta.num_bigrams, "bigram count mismatch");
     anyhow::ensure!(num_trigrams == meta_trigrams, "trigram count mismatch");
+    anyhow::ensure!(num_fourgrams == meta_fourgrams, "fourgram count mismatch");
     anyhow::ensure!(wp_lines == num_words as u64, "word_pinyin.tsv count mismatch");
     anyhow::ensure!(!postings.is_empty(), "postings.bin empty");
 
@@ -1298,6 +1411,16 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
     // trigram spot-check: first key decodes to a valid 12-byte structure.
     if let Some((kbytes, _)) = tri.stream_first() {
         anyhow::ensure!(kbytes.len() == 12, "trigram key not 12 bytes");
+    }
+
+    // fourgram spot-check: keys are 16 bytes and values decode to the signed cost band.
+    if let Some((kbytes, val)) = four.stream_first() {
+        anyhow::ensure!(kbytes.len() == 16, "fourgram key not 16 bytes");
+        let cost = pyime_core::lm::decode_cost(val);
+        anyhow::ensure!(
+            cost.unsigned_abs() <= LM_COST_CLAMP as u32,
+            "fourgram cost {cost} outside ±{LM_COST_CLAMP} band"
+        );
     }
 
     Ok(meta)

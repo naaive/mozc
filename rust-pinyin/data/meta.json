@@ -1,10 +1,11 @@
 {
-  "bytes_total": 50543173,
+  "bytes_total": 51001296,
   "log_base": 500.0,
   "num_bigrams": 733555,
+  "num_fourgrams": 19053,
   "num_readings": 583358,
   "num_trigrams": 48901,
   "num_words": 700000,
-  "source_notes": "rime-ice(base/8105/41448/others/tencent) + rime-essay + jieba-dict back-fill + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words + google-10000-english + toutiao-news-titles + online-shopping; rime-ice-base=ok, rime-ice-8105=ok, rime-ice-41448=ok, rime-ice-others=ok, rime-ice-tencent=ok, rime-essay=ok, opencc-TSCharacters=ok, opencc-TSPhrases=ok, opencc-mappings=3570, general-corpus=toutiao_news_titles, sentence-corpus=online_shopping_10_cats, lexicon: rime-words=596848, freq-supp=316107, jieba-backfill=150908, t2s-normalized=296324, english=60000",
+  "source_notes": "rime-ice(base/8105/41448/others/tencent) + rime-essay + jieba-dict back-fill + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words + google-10000-english + toutiao-news-titles + online-shopping; LM=word bi/tri/4-gram over toutiao+shopping (longest-match tokenization, T->S normalized), absolute-discounting interpolation (bi D=0.75, tri D=1, 4-gram D=1), signed log-ratio costs; min-count bi=5/tri=8/4-gram=7; rime-ice-base=ok, rime-ice-8105=ok, rime-ice-41448=ok, rime-ice-others=ok, rime-ice-tencent=ok, rime-essay=ok, opencc-TSCharacters=ok, opencc-TSPhrases=ok, opencc-mappings=3570, general-corpus=toutiao_news_titles, sentence-corpus=online_shopping_10_cats, lexicon: rime-words=596848, freq-supp=316107, jieba-backfill=150908, t2s-normalized=296324, english=60000",
   "version": 1
 }
