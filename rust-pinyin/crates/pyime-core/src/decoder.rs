@@ -322,13 +322,7 @@ fn beam_search(
     if n == 0 {
         return Vec::new();
     }
-    let _dbg = std::env::var("PYIME_DBG").is_ok();
-    let _t0 = std::time::Instant::now();
     let word_edges = build_word_lattice(engine, lattice, n);
-    if _dbg {
-        let ne: usize = word_edges.iter().map(|b| b.len()).sum();
-        eprintln!("  build_word_lattice n={n} edges={ne} {:.2}ms", _t0.elapsed().as_secs_f64()*1000.0);
-    }
 
     // Arena of DP nodes. Node 0 is the origin (empty prefix at pos 0).
     let mut arena: Vec<VNode> = Vec::with_capacity(n * cfg.beam_width.max(1));

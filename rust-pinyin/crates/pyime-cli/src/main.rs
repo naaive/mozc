@@ -504,117 +504,11 @@ fn ensure_gold(path: &Path, data_dir: &Path, seed: u64) -> Result<()> {
     generate_gold_adapter(&sentences, &hanzi, path, seed)
 }
 
-// --- Adapters onto the (evolving) pyime-eval API ---------------------------
-//
-// The eval task specifies `run_eval`, `generate_gold`, `render_table`, and
-// `EvalReport`. Today only `run_eval(&Engine, &EngineConfig, &Path) -> Result<String>`
-// is published. We code against that stable surface so the CLI always builds,
-// and produce the richer output (JSON / generated gold) as those APIs land.
+// --- pyime-eval API adapters -----------------------------------------------
 
-fn generate_gold_adapter(
-    sentences: &Path,
-    _hanzi: &Path,
-    out: &Path,
-    _seed: u64,
-) -> Result<()> {
-    // Preferred path (once available): pyime_eval::generate_gold(sentences, hanzi, seed)
-    // writing JSONL gold pairs. Until that exists, fall back to a minimal gold set
-    // derived from the held-out sentences so `eval` is runnable end-to-end.
-    fallback_generate_gold(sentences, out)
+fn generate_gold_adapter(sentences: &Path, hanzi: &Path, out: &Path, seed: u64) -> Result<()> {
+    pyime_eval::generate_gold(sentences, hanzi, out, seed)
         .with_context(|| format!("generating gold set at {}", out.display()))
-}
-
-/// Minimal gold generator: take held-out Chinese sentences and emit
-/// `{"input": <pinyin>, "expected": <hanzi>, "bucket": "full"}` JSONL lines,
-/// converting each sentence to canonical pinyin via the hanzi table.
-fn fallback_generate_gold(sentences: &Path, out: &Path) -> Result<()> {
-    // Load the hanzi->pinyin table that sits next to the data dir.
-    let hanzi_tsv = out
-        .parent()
-        .map(|p| p.join("hanzi_pinyin.tsv"))
-        .filter(|p| p.exists())
-        .or_else(|| {
-            let p = PathBuf::from("data/hanzi_pinyin.tsv");
-            p.exists().then_some(p)
-        });
-
-    let table = match hanzi_tsv {
-        Some(p) => load_hanzi_table(&p)?,
-        None => {
-            anyhow::bail!(
-                "hanzi_pinyin.tsv not found; cannot build pinyin for gold set. \
-                 Run `pyime build-data` first."
-            )
-        }
-    };
-
-    let text = std::fs::read_to_string(sentences)
-        .with_context(|| format!("reading {}", sentences.display()))?;
-    let mut buf = String::new();
-    let mut n = 0usize;
-    for line in text.lines() {
-        let s = line.trim();
-        if s.chars().count() < 2 || s.chars().count() > 20 {
-            continue;
-        }
-        // Build canonical pinyin (no separators) for all-CJK lines only.
-        let mut pinyin = String::new();
-        let mut ok = true;
-        for ch in s.chars() {
-            match table.get(&ch) {
-                Some(py) => pinyin.push_str(py),
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok || pinyin.is_empty() {
-            continue;
-        }
-        let obj = serde_json::json!({
-            "input": pinyin,
-            "expected": s,
-            "bucket": "full",
-        });
-        buf.push_str(&serde_json::to_string(&obj)?);
-        buf.push('\n');
-        n += 1;
-        if n >= 2000 {
-            break;
-        }
-    }
-    if n == 0 {
-        anyhow::bail!("produced an empty gold set from {}", sentences.display());
-    }
-    std::fs::write(out, buf).with_context(|| format!("writing {}", out.display()))?;
-    eprintln!("generated {} gold pairs -> {}", n, out.display());
-    Ok(())
-}
-
-/// Load a `char \t pinyin` TSV into a map (first reading per char).
-fn load_hanzi_table(path: &Path) -> Result<std::collections::HashMap<char, String>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let mut map = std::collections::HashMap::new();
-    for line in text.lines() {
-        let mut it = line.splitn(2, '\t');
-        if let (Some(c), Some(py)) = (it.next(), it.next()) {
-            if let Some(ch) = c.chars().next() {
-                // pinyin may be comma/space separated alternatives; take the first.
-                let first = py
-                    .split([',', ' ', '/'])
-                    .next()
-                    .unwrap_or(py)
-                    .trim()
-                    .to_string();
-                if !first.is_empty() {
-                    map.entry(ch).or_insert(first);
-                }
-            }
-        }
-    }
-    Ok(map)
 }
 
 fn run_eval_report(
@@ -623,12 +517,13 @@ fn run_eval_report(
     gold: &Path,
     _seed: u64,
 ) -> Result<EvalOutput> {
-    // Stable surface today: returns the rendered table as a String.
-    let table = pyime_eval::run_eval(engine, cfg, gold)
-        .context("running pyime-eval")?;
-    // When pyime-eval exposes EvalReport + render_table, we will additionally
-    // serialize report.json here. For now the table is the full report.
-    Ok(EvalOutput { table, json: None })
+    let report = pyime_eval::run_eval(engine, cfg, gold).context("running pyime-eval")?;
+    let table = pyime_eval::render_table(&report);
+    let json = serde_json::to_string_pretty(&report).context("serializing eval report")?;
+    Ok(EvalOutput {
+        table,
+        json: Some(json),
+    })
 }
 
 // ===========================================================================
