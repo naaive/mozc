@@ -103,6 +103,37 @@ fn english_words_survive_and_win() {
     }
 }
 
+/// Typo'd full-sentence pinyin (edit-distance ≤1–2) whose corrected Chinese reading COVERS the
+/// whole input must out-rank the opaque whole-input literal passthrough at #1. These do not segment
+/// as exact pinyin (so the clean `fully_segments` demotion does not apply), but the full Chinese
+/// reading is high quality, so the literal must be demoted to just below it (and stay in the list).
+#[test]
+fn typo_sentence_beats_literal() {
+    let Some(e) = engine() else {
+        eprintln!("skip typo_sentence_beats_literal: no data/");
+        return;
+    };
+    let cfg = EngineConfig::default();
+    for (input, want) in [
+        ("wozhinnegshuo", "我只能说"),
+        ("zhuoshagyouliangbenshu", "桌上有两本书"),
+        ("chhlejiageshihui", "除了价格实惠"),
+    ] {
+        let cands = e.convert(input, &cfg);
+        let top = cands.iter().take(5).map(|c| c.text.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            cands.first().map(|c| c.text.as_str()),
+            Some(want),
+            "{input} should rank {want} #1 over the literal, got {top:?}"
+        );
+        // The literal passthrough must still be present in the list (just demoted), not dropped.
+        assert!(
+            cands.iter().any(|c| c.text.eq_ignore_ascii_case(input)),
+            "literal {input} should remain in the candidate list, got {top:?}"
+        );
+    }
+}
+
 /// Mixed CN/EN: `wo用github` → 我用github near the top, classified Mixed.
 #[test]
 fn mixed_cn_en_near_top() {

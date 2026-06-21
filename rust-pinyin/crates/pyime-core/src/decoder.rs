@@ -122,7 +122,15 @@ fn decode_inner(engine: &Engine, input: &str, cfg: &EngineConfig, predict: bool)
     }
 
     // 3. combine sequentially (bounded best-first).
-    let combined = combine(engine, chunk_lists, cfg);
+    let mut combined = combine(engine, chunk_lists, cfg);
+
+    // 3b. Whole-input literal/English passthrough demotion. When a Chinese reading covers the ENTIRE
+    // input (no leftover latin) AND is high quality, the opaque whole-input literal must not rank #1.
+    // This generalizes the clean-pinyin `fully_segments` demotion to typo/fuzzy/abbrev-corrected
+    // inputs, which do not segment as exact pinyin but still have a full Chinese reading.
+    if !predict {
+        demote_full_input_literal(input, &mut combined);
+    }
 
     // 4. to Candidate, sorted, truncated.
     let mut cands: Vec<Candidate> = combined
@@ -137,6 +145,64 @@ fn decode_inner(engine: &Engine, input: &str, cfg: &EngineConfig, predict: bool)
     cands.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
     cands.truncate(cfg.max_candidates);
     cands
+}
+
+/// Per-input-letter cost ceiling for a full-coverage Chinese reading to be considered "high quality"
+/// enough to demote the whole-input literal beneath it. A genuine typo/fuzzy/abbrev-corrected pinyin
+/// sentence reads many input letters into each word, so its total path cost per input letter stays
+/// low (typo examples observed ~660–1240/letter). A real English / junk OOV token (`hello`, `linux`,
+/// `github`, `asdf`) has NO cheap full Chinese reading — forcing one costs ~2000–3300/letter — so it
+/// stays above this ceiling and the literal correctly keeps the top rank. Tuned empirically on
+/// `data/gold*.jsonl`; the gap between the two regimes is wide (~1240 vs ~2018), so 1500 is robust.
+const FULL_COVER_CN_PER_LETTER_MAX: i32 = 1500;
+
+/// Demote the whole-input literal/English passthrough below the best *full-coverage* Chinese
+/// candidate, when such a candidate exists and is high quality.
+///
+/// The whole-input literal is the `English`-kind candidate whose surface is exactly the input's latin
+/// letters (the opaque passthrough produced in `decode_latin`). A "full-coverage Chinese candidate"
+/// is one whose output contains NO ascii letters — i.e. the entire input was read as Chinese with no
+/// leftover latin fragment (this distinguishes `我只能说` from mixed leftovers like `gith不` /
+/// `可以board`, which keep latin and so do NOT trigger demotion → real English passthrough is safe).
+///
+/// The English-vs-typo distinguishing signal is the best full Chinese reading's cost PER INPUT LETTER
+/// (see `FULL_COVER_CN_PER_LETTER_MAX`): typo'd pinyin has a cheap full reading, real English does not.
+/// On a match we raise the literal's score to sit just above the best full Chinese candidate, so the
+/// corrected sentence wins #1 while the literal stays present in the list (just demoted).
+fn demote_full_input_literal(input: &str, combined: &mut [Partial]) {
+    // Number of latin letters in the input (what a full Chinese reading must cover).
+    let input_letters: String = input.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    let n_letters = input_letters.len() as i32;
+    if n_letters == 0 {
+        return;
+    }
+    let lower_letters = input_letters.to_ascii_lowercase();
+
+    // Find the best (cheapest) full-coverage Chinese candidate: no ascii letters in its output.
+    let mut best_cn: Option<i32> = None;
+    for p in combined.iter() {
+        if p.kind == CandidateKind::Chinese && !p.text.chars().any(|c| c.is_ascii_alphabetic()) {
+            best_cn = Some(best_cn.map_or(p.score, |b| b.min(p.score)));
+        }
+    }
+    let Some(best_cn) = best_cn else { return };
+
+    // Quality gate: the full Chinese reading must be cheap per input letter (a real corrected pinyin
+    // sentence), not a forced reading of an English/junk token.
+    if best_cn > FULL_COVER_CN_PER_LETTER_MAX * n_letters {
+        return;
+    }
+
+    // Raise the whole-input literal just above the best full Chinese candidate (keep it in the list).
+    for p in combined.iter_mut() {
+        if p.kind == CandidateKind::English && p.text.eq_ignore_ascii_case(&lower_letters) {
+            // Only ever raise (never lower) the literal's cost.
+            let demoted = best_cn + 1;
+            if p.score < demoted {
+                p.score = demoted;
+            }
+        }
+    }
 }
 
 enum Chunk {
