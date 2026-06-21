@@ -58,8 +58,11 @@ word table · `memmap2` for O(1) load · `rayon` for the eval sweep · release p
 
 Built entirely from **freely-available** sources (see `data/meta.json` for the exact set/counts):
 jieba dictionary (word frequencies), `mozillazg/pinyin-data` + `phrase-pinyin-data`
-(hanzi/phrase→pinyin, with 多音字 disambiguation), `dwyl/english-words`, and a Chinese sentence
-corpus for the bigram LM. ~349k words / ~269k readings / ~131k bigrams.
+(hanzi/phrase→pinyin, with 多音字 disambiguation), a frequency-ranked English list
+(`dwyl/english-words` ∪ `google-10000-english`), and two Chinese sentence corpora for the
+bigram LM — a general-domain news-title set (Toutiao) unioned with a shopping-review set, with
+count-pruning so low-frequency pairs don't crowd out good candidates.
+~349k words / ~269k readings / ~170k bigrams / 60k English words.
 
 **Footprint:** release binary **~3 MB** + `data/` **~13 MB** = **~15 MB total**, far under the
 100 MB budget (data is mmap'd separately, not embedded).
@@ -113,10 +116,16 @@ gold set (release build):
 |-------|------|------|-------|-----|----------|-----------|-------------|
 | Baseline (uncapped, slow) | 0.141 | 0.353 | 0.375 | 0.237 | 0.389 | 0.000 | ~60–330 ms/conv |
 | + perf restructure + ranking | 0.136 | 0.265 | 0.297 | 0.192 | 0.313 | 0.000 | <5 ms (clean) |
-| + recall/mixed/abbr tuning | **0.173** | **0.337** | **0.391** | **0.245** | **0.434** | **0.300** | 18.5 ms (overall) |
+| + recall/mixed/abbr tuning | 0.173 | 0.337 | 0.391 | 0.245 | 0.434 | 0.300 | 18.5 ms (overall) |
+| + corpus/LM upgrade (final) | **0.186** | **0.352** | **0.407** | **0.258** | **0.449** | **0.502** | 18.5 ms (overall) |
 
-Per-bucket highlights (final): `english` 1.000 top-1; `short_word` 0.631 top-1 / 0.829 top-5;
-`full` 0.262 top-1 / 0.595 coverage; `mixed` 0→0.300 top-1 after interleaved CN+EN support.
+Each stage was gated on the eval not regressing. The final corpus/LM upgrade (adding a
+general-domain news corpus to the bigram with count-pruning, and a frequency-ranked English
+list) lifted **mixed** sharply (top1 0.300→0.502, top5 →0.669, coverage →0.759) and raised
+every OVERALL number.
+
+Per-bucket highlights (final): `english` 1.000 top-1; `mixed` 0.502 top-1 / 0.669 top-5 / 0.759
+coverage; `short_word` 0.631 top-1 / 0.829 top-5; `full` 0.260 top-1 / 0.583 coverage.
 
 > **Why sentence-level top-1 looks modest:** the gold expects the engine to reconstruct an entire
 > held-out sentence from tone-less pinyin in one shot — a deliberately harsh metric (real users
@@ -134,9 +143,11 @@ Per-bucket highlights (final): `english` 1.000 top-1; `short_word` 0.631 top-1 /
 ## Limitations & future work
 
 - **Abbreviation** of long whole-sentences is the hardest bucket (inherent ambiguity).
-- The bigram LM's quality is the dominant lever for sentence-level accuracy; a larger
-  general-domain corpus / trigram model would raise it further (the 100 MB budget leaves ample
-  headroom — current data is ~13 MB).
+- The bigram LM's quality is the dominant lever for sentence-level accuracy; a **trigram** model
+  or a much larger corpus would raise it further (the 100 MB budget leaves ample headroom —
+  current data is ~13 MB). Specific gaps remain where the corpus lacks a phrase/bigram, e.g.
+  `woshizhongguoren`→卧室中国人 (我是 vs 卧室 unigram tie) and `woaizhongguo`→我爱中国 (no
+  `我爱` phrase entry).
 - Polyphone readings in the auto-generated gold (e.g. 了 `le`/`liao`) cap a few exact matches.
 - A user dictionary / adaptation layer and zero-query prediction are natural next additions.
 

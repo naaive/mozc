@@ -3,7 +3,7 @@
   "log_base": 500.0,
   "num_words": 348973,
   "num_readings": 268568,
-  "num_bigrams": 131404,
-  "bytes_total": 12447770,
-  "source_notes": "jieba-dict + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words; sentence-corpus=online_shopping_10_cats, english=50000"
+  "num_bigrams": 169586,
+  "bytes_total": 12857693,
+  "source_notes": "jieba-dict + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words + google-10000-english + toutiao-news-titles; general-corpus=toutiao_news_titles, sentence-corpus=online_shopping_10_cats, english=60000"
 }

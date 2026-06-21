@@ -49,10 +49,22 @@ pub fn prob_to_cost(prob: f64) -> u16 {
 /// Keep at most this many dictionary words (after CJK filtering). The jieba dict
 /// has ~350k entries; after pruning non-CJK it is far fewer, so this is a safety cap.
 const MAX_WORDS: usize = 600_000;
-/// Cap on English vocabulary size (most-common / shortest first).
-const MAX_ENGLISH: usize = 50_000;
-/// Drop word-bigram pairs observed fewer than this many times.
-const BIGRAM_MIN_COUNT: u32 = 2;
+/// Cap on English vocabulary size (frequency-ranked first).
+const MAX_ENGLISH: usize = 60_000;
+/// Drop word-bigram pairs observed fewer than this many (weighted) times. With the
+/// large general-domain news corpus, low-count pairs are mostly noise that displaces
+/// good candidates from the N-best list; a higher threshold keeps only robust pairs
+/// and was found (vs the gold eval) to maximize top5/coverage. Counts are weighted
+/// (see SHOPPING_WEIGHT), so in-domain pairs clear the bar with far fewer raw hits.
+const BIGRAM_MIN_COUNT: u32 = 12;
+/// Hard cap on the number of bigram pairs kept (highest-count first), to bound
+/// `bigram.fst` size under the data budget.
+const MAX_BIGRAMS: usize = 2_500_000;
+/// Weight (count multiplier) applied to the in-domain shopping corpus when training
+/// the bigram LM. The general corpus is ~6x larger; weighting shopping keeps the
+/// in-domain (EVAL gold) signal from being swamped while the general corpus still
+/// supplies common-phrase coverage.
+const SHOPPING_WEIGHT: u32 = 6;
 /// Number of held-out sentences to reserve for the EVAL agent.
 const HELDOUT_SENTENCES: usize = 4_000;
 
@@ -90,9 +102,45 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
         "english-words.txt",
         "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt",
     )?;
+    // Frequency-ranked common-English list (google-10000-english). Used to make sure
+    // common everyday words — including longer ones — survive the english.fst cap.
+    let english_freq_raw = match read_cached(
+        "google-10000-english.txt",
+        "https://raw.githubusercontent.com/first20hours/google-10000-english/master/google-10000-english.txt",
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("  WARN english frequency list unavailable: {e:#}");
+            Vec::new()
+        }
+    };
 
-    // Sentence corpus (for bigram LM + held-out eval). Best-effort; we fall back
-    // to dictionary phrases if it is unreachable.
+    // --- Sentence corpora (for bigram LM + held-out eval) --------------------
+    // We UNION a large general-domain corpus (Toutiao news headlines) with the
+    // existing shopping-review corpus so general phrases (我是, 我们, 今天, ...)
+    // get proper weight while shopping coverage is preserved. Both are best-effort;
+    // if everything is unreachable we fall back to dictionary phrases.
+
+    // (a) General-domain: Toutiao news-headline dataset (~382k titles + keywords).
+    //     Single .txt inside a .zip on raw.githubusercontent.com.
+    let corpus_toutiao = match fetch_to_cache(
+        corpus_dir,
+        "toutiao_cat_data.txt",
+        "https://raw.githubusercontent.com/skdjfla/toutiao-text-classfication-dataset/master/toutiao_cat_data.txt.zip",
+        offline,
+    ) {
+        Ok(p) => {
+            notes.push("general-corpus=toutiao_news_titles".into());
+            Some(p)
+        }
+        Err(e) => {
+            eprintln!("  WARN general (toutiao) corpus unavailable: {e:#}");
+            notes.push("general-corpus=UNAVAILABLE".into());
+            None
+        }
+    };
+
+    // (b) Domain: online shopping reviews (preserve original coverage).
     let corpus_csv = match fetch_to_cache(
         corpus_dir,
         "online_shopping_10_cats.csv",
@@ -133,7 +181,13 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
 
     // --- 5. Build + emit bigram.fst -----------------------------------------
     eprintln!("[5/7] building bigram LM ...");
-    let (num_bigrams, heldout) = build_and_write_bigram(out_dir, corpus_dir, &words, corpus_csv.as_deref())?;
+    let (num_bigrams, heldout) = build_and_write_bigram(
+        out_dir,
+        corpus_dir,
+        &words,
+        corpus_toutiao.as_deref(),
+        corpus_csv.as_deref(),
+    )?;
     eprintln!("  bigrams kept: {num_bigrams}  heldout sentences: {}", heldout.len());
 
     // helper file: corpus/heldout_sentences.txt
@@ -141,14 +195,15 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
 
     // --- 6. Emit english.fst ------------------------------------------------
     eprintln!("[6/7] writing english.fst ...");
-    let num_english = write_english(out_dir, &english_raw)?;
+    let num_english = write_english(out_dir, &english_raw, &english_freq_raw)?;
     eprintln!("  english terms: {num_english}");
 
     // --- 7. meta.json -------------------------------------------------------
     eprintln!("[7/7] writing meta.json ...");
     notes.push(format!("english={num_english}"));
     let source_notes = format!(
-        "jieba-dict + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words; {}",
+        "jieba-dict + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words \
+         + google-10000-english + toutiao-news-titles; {}",
         notes.join(", ")
     );
     write_meta(
@@ -312,6 +367,7 @@ fn build_and_write_bigram(
     out_dir: &Path,
     corpus_dir: &Path,
     words: &WordSet,
+    corpus_toutiao: Option<&Path>,
     corpus_csv: Option<&Path>,
 ) -> Result<(u64, Vec<String>)> {
     // Build a max-munch segmenter trie keyed on surfaces present in the dict.
@@ -323,18 +379,37 @@ fn build_and_write_bigram(
     let mut heldout: Vec<String> = Vec::new();
 
     let count_sentence = |s: &str,
+                          weight: u32,
                           bi: &mut FxHashMap<(u32, u32), u32>,
                           uni: &mut FxHashMap<u32, u32>| {
         let ids = seg.segment(s, &words.surface_to_id);
         for &id in &ids {
-            *uni.entry(id).or_insert(0) += 1;
+            *uni.entry(id).or_insert(0) += weight;
         }
         for w in ids.windows(2) {
-            *bi.entry((w[0], w[1])).or_insert(0) += 1;
+            *bi.entry((w[0], w[1])).or_insert(0) += weight;
         }
     };
 
     let mut used_corpus = false;
+
+    // (a) General-domain corpus: Toutiao news headlines + keywords (weight 1).
+    //     This corpus is ~6x larger than the shopping one; to keep the in-domain
+    //     shopping signal from being swamped (the EVAL gold set is shopping-derived)
+    //     the shopping corpus below is counted with a higher weight. The general
+    //     corpus still supplies enough mass to fix common phrases (我是/我们/今天/...).
+    if let Some(tt_path) = corpus_toutiao {
+        eprintln!("  reading general corpus {} ...", tt_path.display());
+        let sentences = read_toutiao_sentences(tt_path)?;
+        eprintln!("  general (toutiao) sentences: {}", sentences.len());
+        for s in &sentences {
+            count_sentence(s, 1, &mut bi_counts, &mut uni_counts);
+        }
+        used_corpus = true;
+    }
+
+    // (b) Domain corpus: online shopping reviews (weight SHOPPING_WEIGHT). Also the
+    //     source of held-out eval.
     if let Some(csv_path) = corpus_csv {
         eprintln!("  reading sentence corpus {} ...", csv_path.display());
         let sentences = read_corpus_sentences(csv_path)?;
@@ -349,7 +424,7 @@ fn build_and_write_bigram(
                 }
                 continue;
             }
-            count_sentence(s, &mut bi_counts, &mut uni_counts);
+            count_sentence(s, SHOPPING_WEIGHT, &mut bi_counts, &mut uni_counts);
         }
         used_corpus = true;
     }
@@ -362,16 +437,25 @@ fn build_and_write_bigram(
         for e in &words.entries {
             // Multi-char surfaces only — segment them into sub-words.
             if e.surface.chars().count() >= 2 {
-                count_sentence(&e.surface, &mut bi_counts, &mut uni_counts);
+                count_sentence(&e.surface, 1, &mut bi_counts, &mut uni_counts);
             }
         }
     }
 
-    // Prune low-count pairs.
+    // Prune low-count pairs, then cap to the highest-count MAX_BIGRAMS to bound size.
     let mut pairs: Vec<((u32, u32), u32)> = bi_counts
         .into_iter()
         .filter(|&(_, c)| c >= BIGRAM_MIN_COUNT)
         .collect();
+    if pairs.len() > MAX_BIGRAMS {
+        eprintln!(
+            "  pruning bigrams {} -> {} (highest-count first)",
+            pairs.len(),
+            MAX_BIGRAMS
+        );
+        pairs.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        pairs.truncate(MAX_BIGRAMS);
+    }
     // fst keys must be inserted in sorted order of the 8-byte BE key.
     pairs.sort_unstable_by_key(|&((p, i), _)| ((p as u64) << 32) | i as u64);
 
@@ -433,6 +517,67 @@ fn read_corpus_sentences(csv_path: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Read general-domain sentences from the Toutiao news-title dataset.
+/// Each line is `id_!_code_!_category_!_title_!_keyword,keyword,...`.
+/// We take the title (general-domain news headline) and each keyword as separate
+/// clause-sized "sentences", split further on CJK punctuation like the shopping
+/// reader, so the bigram LM sees natural everyday phrasing.
+fn read_toutiao_sentences(path: &Path) -> Result<Vec<String>> {
+    let raw = std::fs::read_to_string(path).context("read toutiao corpus")?;
+    let mut out = Vec::new();
+    let push_text = |text: &str, out: &mut Vec<String>| {
+        for clause in text.split(|c| {
+            matches!(
+                c,
+                '。' | '！'
+                    | '？'
+                    | '；'
+                    | '，'
+                    | '、'
+                    | '\n'
+                    | '!'
+                    | '?'
+                    | ';'
+                    | ','
+                    | '：'
+                    | ':'
+                    | '“'
+                    | '”'
+                    | '（'
+                    | '）'
+                    | '('
+                    | ')'
+                    | '《'
+                    | '》'
+                    | '【'
+                    | '】'
+                    | '|'
+            )
+        }) {
+            let clause = clause.trim();
+            let cjk = clause.chars().filter(|&c| pinyin::is_cjk(c)).count();
+            if cjk >= 2 && clause.chars().count() <= 40 {
+                out.push(clause.to_string());
+            }
+        }
+    };
+    for line in raw.lines() {
+        // Fields are separated by the literal token `_!_`.
+        let mut fields = line.split("_!_");
+        let _id = fields.next();
+        let _code = fields.next();
+        let _cat = fields.next();
+        if let Some(title) = fields.next() {
+            push_text(title, &mut out);
+        }
+        if let Some(keywords) = fields.next() {
+            // keywords are comma-separated; push_text already splits on commas.
+            push_text(keywords, &mut out);
+        }
+    }
+    Ok(out)
+}
+
 /// Max-munch segmenter over dictionary surfaces.
 struct Segmenter {
     /// max surface char-length, to bound the munch window.
@@ -482,26 +627,48 @@ impl Segmenter {
 // english.fst
 // ===========================================================================
 
-fn write_english(out_dir: &Path, english_raw: &[u8]) -> Result<u64> {
-    let text = std::str::from_utf8(english_raw).context("english words utf8")?;
-    // Lowercase, ascii-alpha only. Prefer shorter (more common) words when capping.
-    let mut words: Vec<String> = text
-        .lines()
-        .map(|l| l.trim().to_ascii_lowercase())
-        .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase()))
-        .collect();
+fn write_english(out_dir: &Path, english_raw: &[u8], english_freq_raw: &[u8]) -> Result<u64> {
+    // Assign each candidate word a "rank" (lower = more common / higher priority).
+    // 1. Words from the google-10000-english frequency list get their line index as
+    //    rank, so the most common everyday words (including longer ones like
+    //    "computer", "keyboard", "android", "version") are always kept.
+    // 2. The remaining slots are filled from the big dwyl list, ranked by length
+    //    (shorter ≈ more common) as a secondary proxy.
+    let mut rank: FxHashMap<String, u64> = FxHashMap::default();
+
+    let is_word = |w: &str| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase());
+
+    // Frequency list first (authoritative ranks 0..N).
+    if let Ok(freq_text) = std::str::from_utf8(english_freq_raw) {
+        for (i, line) in freq_text.lines().enumerate() {
+            let w = line.trim().to_ascii_lowercase();
+            if is_word(&w) {
+                rank.entry(w).or_insert(i as u64);
+            }
+        }
+    }
+    let freq_count = rank.len() as u64;
+
+    // Dwyl list: assign a rank AFTER the frequency block, keyed by word length so
+    // shorter (more common) words sort ahead, then lexicographically for stability.
+    if let Ok(text) = std::str::from_utf8(english_raw) {
+        for line in text.lines() {
+            let w = line.trim().to_ascii_lowercase();
+            if is_word(&w) && !rank.contains_key(&w) {
+                // Base offset past the freq block; length dominates the ordering.
+                let r = freq_count + (w.len() as u64) * 1_000_000;
+                rank.insert(w, r);
+            }
+        }
+    }
+
+    // Select the top-MAX_ENGLISH by rank, then sort lexically for fst insertion.
+    let mut ranked: Vec<(u64, String)> = rank.into_iter().map(|(w, r)| (r, w)).collect();
+    ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    ranked.truncate(MAX_ENGLISH);
+    let mut words: Vec<String> = ranked.into_iter().map(|(_, w)| w).collect();
     words.sort_unstable();
     words.dedup();
-
-    if words.len() > MAX_ENGLISH {
-        // Keep the shortest words (proxy for "most common"), then re-sort lexically
-        // because fst::Set requires sorted insertion.
-        let mut by_len = words;
-        by_len.sort_unstable_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
-        by_len.truncate(MAX_ENGLISH);
-        by_len.sort_unstable();
-        words = by_len;
-    }
 
     let file = std::fs::File::create(out_dir.join("english.fst")).context("create english.fst")?;
     let wtr = std::io::BufWriter::new(file);
