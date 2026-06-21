@@ -135,7 +135,7 @@ pub fn fuzzy_variants(syl: &str, set: FuzzySet) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
     let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
 
-    let mut push = |s: String, fuzzy: bool, out: &mut Vec<(String, bool)>, seen: &mut rustc_hash::FxHashSet<String>| {
+    let push = |s: String, fuzzy: bool, out: &mut Vec<(String, bool)>, seen: &mut rustc_hash::FxHashSet<String>| {
         if is_syllable(&s) && seen.insert(s.clone()) {
             out.push((s, fuzzy));
         }

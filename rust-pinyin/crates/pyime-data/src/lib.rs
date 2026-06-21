@@ -12,7 +12,7 @@
 //!   - [`verify`]     — load the produced data back and report counts + bytes.
 
 use anyhow::{Context, Result};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -70,29 +70,25 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
 
     // --- 1. Download sources (cached) ---------------------------------------
     eprintln!("[1/7] fetching sources (offline={offline}) ...");
-    let hanzi_raw = fetch_to_cache(
-        corpus_dir,
+    let read_cached = |name: &str, url: &str| -> Result<Vec<u8>> {
+        let p = fetch_to_cache(corpus_dir, name, url, offline)?;
+        std::fs::read(&p).with_context(|| format!("read cached {}", p.display()))
+    };
+    let hanzi_raw = read_cached(
         "pinyin-data.txt",
         "https://raw.githubusercontent.com/mozillazg/pinyin-data/master/pinyin.txt",
-        offline,
     )?;
-    let phrase_raw = fetch_to_cache(
-        corpus_dir,
+    let phrase_raw = read_cached(
         "phrase-pinyin-data.txt",
         "https://raw.githubusercontent.com/mozillazg/phrase-pinyin-data/master/pinyin.txt",
-        offline,
     )?;
-    let jieba_raw = fetch_to_cache(
-        corpus_dir,
+    let jieba_raw = read_cached(
         "jieba-dict.txt",
         "https://raw.githubusercontent.com/fxsjy/jieba/master/jieba/dict.txt",
-        offline,
     )?;
-    let english_raw = fetch_to_cache(
-        corpus_dir,
+    let english_raw = read_cached(
         "english-words.txt",
         "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt",
-        offline,
     )?;
 
     // Sentence corpus (for bigram LM + held-out eval). Best-effort; we fall back
@@ -326,9 +322,9 @@ fn build_and_write_bigram(
     let mut uni_counts: FxHashMap<u32, u32> = FxHashMap::default();
     let mut heldout: Vec<String> = Vec::new();
 
-    let mut count_sentence = |s: &str,
-                              bi: &mut FxHashMap<(u32, u32), u32>,
-                              uni: &mut FxHashMap<u32, u32>| {
+    let count_sentence = |s: &str,
+                          bi: &mut FxHashMap<(u32, u32), u32>,
+                          uni: &mut FxHashMap<u32, u32>| {
         let ids = seg.segment(s, &words.surface_to_id);
         for &id in &ids {
             *uni.entry(id).or_insert(0) += 1;
@@ -336,7 +332,6 @@ fn build_and_write_bigram(
         for w in ids.windows(2) {
             *bi.entry((w[0], w[1])).or_insert(0) += 1;
         }
-        ids.len()
     };
 
     let mut used_corpus = false;
@@ -624,7 +619,7 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
     // lexicon.fst
     let lex_bytes = std::fs::read(out_dir.join("lexicon.fst")).context("read lexicon.fst")?;
     let lex = Map::new(lex_bytes).context("open lexicon.fst")?;
-    let num_readings = lex.len();
+    let num_readings = lex.len() as u64;
 
     // postings.bin sanity: read one posting at a sampled key offset.
     let postings = std::fs::read(out_dir.join("postings.bin")).context("read postings.bin")?;
@@ -632,7 +627,7 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
     // bigram.fst
     let bi_bytes = std::fs::read(out_dir.join("bigram.fst")).context("read bigram.fst")?;
     let bi = Map::new(bi_bytes).context("open bigram.fst")?;
-    let num_bigrams = bi.len();
+    let num_bigrams = bi.len() as u64;
 
     // english.fst
     let en_bytes = std::fs::read(out_dir.join("english.fst")).context("read english.fst")?;
@@ -678,5 +673,66 @@ impl<D: AsRef<[u8]>> MapFirst for fst::Map<D> {
         use fst::Streamer;
         let mut s = self.stream();
         s.next().map(|(k, v)| (k.to_vec(), v))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prob_cost_monotonic() {
+        assert!(prob_to_cost(0.5) < prob_to_cost(0.01));
+        assert_eq!(prob_to_cost(0.0), COST_MAX);
+        assert_eq!(prob_to_cost(1.0), 0);
+    }
+
+    #[test]
+    fn syllable_normalization() {
+        assert_eq!(pinyin::normalize_syllable("nǐ"), "ni");
+        assert_eq!(pinyin::normalize_syllable("lǜ"), "lv");
+        assert_eq!(pinyin::normalize_syllable("hǎo"), "hao");
+        assert_eq!(pinyin::normalize_syllable("zhong4"), "zhong");
+    }
+
+    /// If a built data dir exists, query the lexicon for known readings and confirm
+    /// the expected surfaces are present in the posting list.
+    #[test]
+    fn lexicon_roundtrip_if_built() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data"));
+        if !dir.join("lexicon.fst").exists() {
+            eprintln!("(skipping: no built data at {})", dir.display());
+            return;
+        }
+        let lex = fst::Map::new(std::fs::read(dir.join("lexicon.fst")).unwrap()).unwrap();
+        let postings = std::fs::read(dir.join("postings.bin")).unwrap();
+        let words_bytes = std::fs::read(dir.join("words.bin")).unwrap();
+        let words =
+            rkyv::check_archived_root::<Vec<pyime_core::format::WordEntry>>(&words_bytes).unwrap();
+
+        let check = |key: &str, want: &str| {
+            let off = lex
+                .get(key)
+                .unwrap_or_else(|| panic!("key {key} missing")) as usize;
+            let n = u16::from_le_bytes([postings[off], postings[off + 1]]) as usize;
+            let mut found = false;
+            for i in 0..n {
+                let base = off + 2 + i * 6;
+                let id = u32::from_le_bytes([
+                    postings[base],
+                    postings[base + 1],
+                    postings[base + 2],
+                    postings[base + 3],
+                ]) as usize;
+                if words[id].surface.as_str() == want {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "expected surface {want} under reading {key}");
+        };
+        check("ni'hao", "你好");
+        check("bei'jing", "北京");
+        check("chong'qing", "重庆"); // phrase-override disambiguation (not zhong'qing)
     }
 }
