@@ -37,6 +37,11 @@ pub mod consts {
     /// dropping one order is small. Kept low so a present trigram is preferred but a missing one
     /// still ranks cleanly on its bigram evidence (no longer dwarfs the bigram scale).
     pub const TRIGRAM_BACKOFF: i32 = 300;
+    /// Backoff surcharge added when a *4-gram* `(w0,w1,w2,w3)` is absent and the rescoring pass
+    /// falls through to the (signed) trigram log-ratio. Same rationale as `TRIGRAM_BACKOFF`: with
+    /// interpolation, dropping one order is mild evidence, so the surcharge is small. Tuned by the
+    /// 4-gram rescoring agent against the eval harness.
+    pub const FOURGRAM_BACKOFF: i32 = 300;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

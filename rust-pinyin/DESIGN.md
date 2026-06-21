@@ -50,6 +50,7 @@ All files live in `data/`. Loaded via mmap where possible. Costs are integers
 | file               | format     | meaning |
 |--------------------|------------|---------|
 | `trigram.fst`      | `fst::Map` | key = 12 bytes BE = (u32 w1, u32 w2, u32 w3); value = u64 = trigram_cost. **Optional** — engine works without it (bigram-only). |
+| `fourgram.fst`     | `fst::Map` | key = 16 bytes BE = (u32 w0,w1,w2,w3) via `fourgram_key`; value = u64 = 4-gram cost (same signed-log-ratio encoding as bigram/trigram). **Optional** — used as an N-best rescoring pass on top of the trigram beam (recompute each candidate's path cost with 4-gram→3→2→1 stupid-backoff, re-sort), so latency stays flat and the beam state does not grow. |
 | `word_pinyin.tsv`  | TSV        | `word<TAB>canonical_reading` (syllables joined by `'`), the curated lexicon export used by eval to generate CORRECT-reading gold via longest-match tokenization. |
 
 **Language model (stupid-backoff):** `P(w3|w1,w2)` cost = `trigram.fst[(w1,w2,w3)]` if present,

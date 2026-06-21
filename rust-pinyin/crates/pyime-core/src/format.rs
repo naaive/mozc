@@ -46,3 +46,14 @@ pub fn trigram_key(w1: u32, w2: u32, w3: u32) -> [u8; 12] {
     k[8..].copy_from_slice(&w3.to_be_bytes());
     k
 }
+
+/// Encode a (w0, w1, w2, w3) 4-gram into the 16-byte big-endian fst key.
+#[inline]
+pub fn fourgram_key(w0: u32, w1: u32, w2: u32, w3: u32) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[..4].copy_from_slice(&w0.to_be_bytes());
+    k[4..8].copy_from_slice(&w1.to_be_bytes());
+    k[8..12].copy_from_slice(&w2.to_be_bytes());
+    k[12..].copy_from_slice(&w3.to_be_bytes());
+    k
+}
