@@ -127,6 +127,40 @@ Metrics per bucket and overall:
 - **Memory**: RSS after load; data size on disk
 Output: a human-readable table + a `report.json`. `cli eval` prints it. Regenerate easily.
 
+## User dictionary + online adaptation (pyime-core) — v3 addition
+Every commercial IME learns from what the user commits. `pyime-core` gains an optional, persistent
+**user model** that personalizes ranking online (CPU-trivial, no training).
+
+State (`UserModel`, serialized to a small JSON/bincode file in a user data dir):
+- **user unigram counts**: `word → count` (and a monotonic `last_used` tick for recency/LRU).
+- **user bigram counts**: `(prev_word, word) → count` for personalized transitions.
+- **user phrases**: `pinyin_key → surface` committed as a unit — AUTO-LEARNS new words/phrases not
+  in the base lexicon, surfaced as high-priority candidates when the input matches.
+
+API additions (STABLE):
+```rust
+impl Engine {
+    /// Attach a user model, loading prior history from `path` if it exists.
+    pub fn with_user_model(self, path: Option<std::path::PathBuf>) -> Engine;
+    /// Learn from a committed selection: input buffer → chosen output. Updates counts/recency/phrases.
+    pub fn commit(&self, input: &str, chosen: &str);
+    /// Persist the user model to its path (no-op if none/unset).
+    pub fn save_user(&self) -> anyhow::Result<()>;
+}
+// EngineConfig gains:  pub user_weight: i32   // strength of personalization (0 = off)
+```
+The user model is read during `convert`/`predict` (so `commit` uses interior mutability that stays
+`Sync` for the rayon eval sweep — e.g. `RwLock`). Scoring blends a **user bonus** (negative cost):
+recently/frequently committed words get a capped cost reduction `≈ -user_weight·f(count, recency)`;
+a matching user phrase is injected as a candidate with a strong bonus; user bigrams refine the
+transition. Bonuses are capped so personalization re-ranks within the N-best without breaking
+clean-input correctness.
+
+Evaluation (extends pyime-eval): a **personalization benchmark** — simulate a user session as a
+stream of `(input, gold)` where a subset of phrases/words recur or are user-specific; measure
+top-1/MRR with the user model OFF vs. ON (online: `commit(gold)` after each item) and report the
+lift per scenario. This quantifies the adaptation, per the "全面量化" requirement.
+
 ## Performance / size budgets
 - Total `data/` + release binary **< 100 MB**. Prefer separate mmap'd data files; if embedding,
   zstd-compress. Quantize bigram aggressively (prune low-count pairs, u16 costs).
