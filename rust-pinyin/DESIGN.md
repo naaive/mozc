@@ -46,6 +46,17 @@ All files live in `data/`. Loaded via mmap where possible. Costs are integers
 | `bigram.fst`    | `fst::Map`            | key = 8 bytes BE = (u32 prev_id, u32 id); value = u64 = bigram_cost |
 | `english.fst`   | `fst::Set`            | english/letter vocabulary for passthrough ranking (lowercased) |
 
+### v2 additions (commercial-grade upgrade)
+| file               | format     | meaning |
+|--------------------|------------|---------|
+| `trigram.fst`      | `fst::Map` | key = 12 bytes BE = (u32 w1, u32 w2, u32 w3); value = u64 = trigram_cost. **Optional** — engine works without it (bigram-only). |
+| `word_pinyin.tsv`  | TSV        | `word<TAB>canonical_reading` (syllables joined by `'`), the curated lexicon export used by eval to generate CORRECT-reading gold via longest-match tokenization. |
+
+**Language model (stupid-backoff):** `P(w3|w1,w2)` cost = `trigram.fst[(w1,w2,w3)]` if present,
+else `TRIGRAM_BACKOFF + ( bigram.fst[(w2,w3)] if present else BIGRAM_BACKOFF + unigram_cost(w3) )`.
+Lexicon readings/weights are sourced primarily from the hand-curated **rime-ice** dictionaries
+(correct polyphone readings + frequencies), supplemented by jieba for coverage.
+
 Canonical pinyin syllable = standard Hanyu Pinyin without tone marks (v/ü → `v`).
 The decoder performs syllable segmentation + fuzzy/abbrev/correction expansion itself; the
 lexicon stores ONLY canonical readings. Matching is done by walking the FST with a custom

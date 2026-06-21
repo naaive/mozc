@@ -36,3 +36,13 @@ pub fn bigram_key(prev_id: u32, id: u32) -> [u8; 8] {
     k[4..].copy_from_slice(&id.to_be_bytes());
     k
 }
+
+/// Encode a (w1, w2, w3) trigram into the 12-byte big-endian fst key.
+#[inline]
+pub fn trigram_key(w1: u32, w2: u32, w3: u32) -> [u8; 12] {
+    let mut k = [0u8; 12];
+    k[..4].copy_from_slice(&w1.to_be_bytes());
+    k[4..8].copy_from_slice(&w2.to_be_bytes());
+    k[8..].copy_from_slice(&w3.to_be_bytes());
+    k
+}
