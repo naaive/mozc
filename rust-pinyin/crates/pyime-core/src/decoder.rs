@@ -11,8 +11,36 @@
 
 use crate::consts::ENGLISH_PEN;
 use crate::segment::{self, Edge, Normalized};
+use crate::user::{UserModel, PHRASE_BONUS, USER_WEIGHT_STD};
 use crate::{Candidate, CandidateKind, Engine, EngineConfig, Segment};
 use rustc_hash::FxHashMap;
+
+/// Read-side view of the attached user model for one `convert`/`predict` call: a borrowed model plus
+/// the effective `user_weight`. Built once (one read-lock) and threaded into the scorer; when the
+/// model is absent or `user_weight == 0` it is `None`, so personalization adds ZERO overhead and the
+/// results are byte-identical to the no-user-model engine.
+#[derive(Clone, Copy)]
+struct UserCtx<'a> {
+    model: &'a UserModel,
+    weight: i32,
+}
+
+impl<'a> UserCtx<'a> {
+    /// Scale a raw bonus by `user_weight / USER_WEIGHT_STD` (integer math, rounding toward zero).
+    #[inline]
+    fn scale(&self, raw: i32) -> i32 {
+        if raw == 0 {
+            return 0;
+        }
+        (raw as i64 * self.weight as i64 / USER_WEIGHT_STD as i64) as i32
+    }
+
+    /// Scaled negative-cost discount for placing `word_id` after `prev` (unigram + bigram).
+    #[inline]
+    fn word_bonus(&self, word_id: u32, prev: Option<u32>) -> i32 {
+        self.scale(self.model.bonus(word_id, prev))
+    }
+}
 
 const LITERAL_PASS_COST: i32 = 50; // tiny cost for literal CJK passthrough segments
 
@@ -123,6 +151,18 @@ fn decode_inner(engine: &Engine, input: &str, cfg: &EngineConfig, predict: bool)
         return Vec::new();
     }
 
+    // Read the user model ONCE for this call (a single read-lock held for the whole decode). The
+    // guard lives on the stack; we derive an `Option<UserCtx>` that is `None` when no model is
+    // attached, when the model is empty, or when `user_weight == 0` — in all of which cases every
+    // downstream bonus is skipped and the result is identical to the no-user-model engine.
+    let user_guard = engine.user.read().unwrap();
+    let user: Option<UserCtx> = match user_guard.as_ref() {
+        Some(m) if cfg.user_weight != 0 && !m.is_empty() => {
+            Some(UserCtx { model: m, weight: cfg.user_weight })
+        }
+        _ => None,
+    };
+
     // 1. chunk by latin vs non-latin over the ORIGINAL input bytes.
     let chunks = chunk_input(input);
 
@@ -131,7 +171,7 @@ fn decode_inner(engine: &Engine, input: &str, cfg: &EngineConfig, predict: bool)
     for ch in &chunks {
         let list = match ch {
             Chunk::Latin { text, byte_start } => {
-                decode_latin(engine, text, *byte_start, cfg, predict)
+                decode_latin(engine, text, *byte_start, cfg, predict, user)
             }
             Chunk::Literal { text, byte_start } => {
                 vec![literal_partial(text, *byte_start)]
@@ -151,7 +191,15 @@ fn decode_inner(engine: &Engine, input: &str, cfg: &EngineConfig, predict: bool)
     }
 
     // 3. combine sequentially (bounded best-first).
-    let mut combined = combine(engine, chunk_lists, cfg);
+    let mut combined = combine(engine, chunk_lists, cfg, user);
+
+    // 3a. Inject a matching user-phrase candidate (auto-learned units, incl. words NOT in the base
+    // lexicon). When the normalized input exactly matches a stored phrase key, surface that committed
+    // surface with a strong (capped, weight-scaled) bonus so a previously-committed phrase ranks
+    // at/near #1 next time. Inert when no user model / `user_weight == 0`.
+    if let Some(uc) = user {
+        inject_user_phrase(input, uc, &mut combined);
+    }
 
     // 3b. 4-gram N-best RESCORING (convert only). When `fourgram.fst` is loaded, recompute the LM
     // portion of each retained candidate's TOTAL cost with the 4-gram model (4→3→2→1 stupid-backoff)
@@ -185,6 +233,62 @@ fn decode_inner(engine: &Engine, input: &str, cfg: &EngineConfig, predict: bool)
     cands.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
     cands.truncate(cfg.max_candidates);
     cands
+}
+
+/// Inject a previously-committed user phrase as a candidate when the normalized input matches a
+/// stored phrase key exactly. The phrase is given a score just below the current best candidate,
+/// minus the (weight-scaled, capped) `PHRASE_BONUS`, so a re-typed committed phrase reliably ranks
+/// at/near #1 — INCLUDING auto-learned surfaces not in the base lexicon (names/neologisms), which the
+/// normal lattice never produces. If the exact phrase surface is already present, we instead lower
+/// that existing candidate's score (never raise it), so it climbs rather than duplicating.
+fn inject_user_phrase(input: &str, uc: UserCtx, combined: &mut Vec<Partial>) {
+    let Some(surface) = uc.model.phrase_for(input) else { return };
+    if surface.is_empty() {
+        return;
+    }
+    let bonus = uc.scale(PHRASE_BONUS);
+    if bonus <= 0 {
+        return;
+    }
+    // Best (cheapest) current score, so the phrase lands at/above the top.
+    let best = combined.iter().map(|p| p.score).min().unwrap_or(0);
+    let target = best - bonus;
+
+    // If the surface already exists as a candidate, just pull it up (climb to `target` if cheaper).
+    if let Some(p) = combined.iter_mut().find(|p| p.text == surface) {
+        if target < p.score {
+            p.score = target;
+        }
+        return;
+    }
+
+    // Classify the injected surface for `kind` (latin-only ⇒ English, any latin ⇒ Mixed, else Chinese).
+    let has_latin = surface.chars().any(|c| c.is_ascii_alphabetic());
+    let all_latin = surface.chars().all(|c| c.is_ascii_alphanumeric());
+    let kind = if all_latin {
+        CandidateKind::English
+    } else if has_latin {
+        CandidateKind::Mixed
+    } else {
+        CandidateKind::Chinese
+    };
+    let span = (0usize, input.len());
+    combined.push(Partial {
+        text: surface.to_string(),
+        score: target,
+        segments: vec![Segment {
+            text: surface.to_string(),
+            reading: String::new(),
+            input_span: span,
+        }],
+        last_word_id: None,
+        first_word_id: None,
+        kind,
+        // Injected phrase carries no LM word identity (history reset), so the 4-gram rescoring pass
+        // treats it as a single sentinel context and leaves its score untouched.
+        word_chain: vec![crate::lm::SENTENCE_START],
+        trigram_trans_sum: 0,
+    });
 }
 
 /// Per-input-letter cost ceiling for a full-coverage Chinese reading to be considered "high quality"
@@ -501,6 +605,7 @@ fn decode_latin(
     byte_start: usize,
     cfg: &EngineConfig,
     predict: bool,
+    user: Option<UserCtx>,
 ) -> Vec<Partial> {
     let norm = segment::normalize(text);
     if norm.letters.is_empty() {
@@ -509,7 +614,7 @@ fn decode_latin(
     let lattice = segment::build_lattice(&norm, cfg);
 
     // Pinyin beam search.
-    let mut results = beam_search(engine, &norm, &lattice, byte_start, cfg, predict);
+    let mut results = beam_search(engine, &norm, &lattice, byte_start, cfg, predict, user);
 
     // English passthrough for the whole run (and per-run if it matches english vocab).
     if cfg.enable_english {
@@ -771,6 +876,7 @@ fn beam_search(
     byte_start: usize,
     cfg: &EngineConfig,
     predict: bool,
+    user: Option<UserCtx>,
 ) -> Vec<Partial> {
     let n = norm.letters.len();
     if n == 0 {
@@ -871,7 +977,22 @@ fn beam_search(
                         .lm
                         .transition_cost3(w_prevprev, w_prev, we.word_id, unigram_w3)
                 };
-                let new_score = prev.score + we.cost + trans;
+                // Online personalization: subtract the (weight-scaled, capped) user bonus for placing
+                // this word after the previous one. English edges carry no LM identity and get no
+                // bonus. Zero (and skipped) when no user model / user_weight == 0.
+                let user_bonus = if we.word_id == ENGLISH_EDGE {
+                    0
+                } else if let Some(uc) = user {
+                    let prev_word = if w_prev == crate::lm::SENTENCE_START {
+                        None
+                    } else {
+                        Some(w_prev)
+                    };
+                    uc.word_bonus(we.word_id, prev_word)
+                } else {
+                    0
+                };
+                let new_score = prev.score + we.cost + trans - user_bonus;
                 let node_idx = arena.len();
                 arena.push(VNode {
                     score: new_score,
@@ -1090,7 +1211,12 @@ fn dedup_best(list: &mut Vec<Partial>) {
 }
 
 /// Combine chunk N-best lists sequentially. Bounded best-first product.
-fn combine(engine: &Engine, lists: Vec<Vec<Partial>>, cfg: &EngineConfig) -> Vec<Partial> {
+fn combine(
+    engine: &Engine,
+    lists: Vec<Vec<Partial>>,
+    cfg: &EngineConfig,
+    user: Option<UserCtx>,
+) -> Vec<Partial> {
     let want_chain = engine.lm.has_fourgram();
     // Widen the retained product modestly when 4-gram rescoring is active so the gold path is more
     // likely to be in the N-best that gets re-ranked. Bounded so latency stays flat.
@@ -1122,6 +1248,12 @@ fn combine(engine: &Engine, lists: Vec<Vec<Partial>>, cfg: &EngineConfig) -> Vec
                     (Some(p), Some(first)) => engine.lm.transition_cost(Some(p), first),
                     _ => 0,
                 };
+                // Cross-chunk user bigram bonus: the first word of `b` was scored in its own chunk
+                // with no left context, so add the personalized transition from `a`'s last word here.
+                let user_bonus: i32 = match (user, a.last_word_id, b.first_word_id) {
+                    (Some(uc), Some(p), Some(first)) => uc.scale(uc.model.bigram_bonus(Some(p), first)),
+                    _ => 0,
+                };
                 let kind = merge_kind(a.kind, b.kind, a.segments.is_empty(), b.segments.is_empty());
                 let mut segs = a.segments.clone();
                 segs.extend(b.segments.iter().cloned());
@@ -1137,7 +1269,7 @@ fn combine(engine: &Engine, lists: Vec<Vec<Partial>>, cfg: &EngineConfig) -> Vec
                 };
                 next.push(Partial {
                     text: format!("{}{}", a.text, b.text),
-                    score: a.score + b.score + trans,
+                    score: a.score + b.score + trans - user_bonus,
                     segments: segs,
                     last_word_id: b.last_word_id.or(a.last_word_id),
                     first_word_id: a.first_word_id.or(b.first_word_id),

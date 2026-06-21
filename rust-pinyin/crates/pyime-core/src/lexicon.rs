@@ -16,8 +16,10 @@ use crate::format::{ArchivedWordEntry, WordEntry};
 use crate::segment::Edge;
 use fst::raw::{Fst, Node, Output};
 use memmap2::Mmap;
+use rustc_hash::FxHashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// A dictionary match covering a lattice path: word(s) + their costs + input span + edit cost.
 #[derive(Debug, Clone)]
@@ -76,6 +78,10 @@ pub struct Lexicon {
     /// Optional English vocabulary (fst::Set) for passthrough ranking.
     _english_mmap: Option<Mmap>,
     english: Option<Fst<&'static [u8]>>,
+    /// Lazily-built reverse index: surface string → the cheapest word id with that surface. Built on
+    /// first use by `surface_to_id` (the user model's tokenizer); not needed by the hot decode path,
+    /// so we avoid paying the construction cost unless online adaptation is active.
+    surface_index: OnceLock<FxHashMap<String, u32>>,
 }
 
 impl Lexicon {
@@ -118,7 +124,71 @@ impl Lexicon {
             num_words,
             _english_mmap: english_mmap,
             english,
+            surface_index: OnceLock::new(),
         })
+    }
+
+    /// Lazily build (and cache) a `surface → cheapest word id` reverse index. Used only by the user
+    /// model's surface tokenizer, so it is constructed on first `commit`, never on the decode path.
+    fn surface_index(&self) -> &FxHashMap<String, u32> {
+        self.surface_index.get_or_init(|| {
+            let words = self.archived_words();
+            let mut map: FxHashMap<String, u32> = FxHashMap::default();
+            for (id, w) in words.iter().enumerate() {
+                let surface = w.surface.as_str();
+                let cost: u16 = w.unigram_cost.into();
+                map.entry(surface.to_string())
+                    .and_modify(|cur| {
+                        // Keep the cheapest (most frequent) id for an ambiguous surface.
+                        let cur_cost: u16 = words[*cur as usize].unigram_cost.into();
+                        if cost < cur_cost {
+                            *cur = id as u32;
+                        }
+                    })
+                    .or_insert(id as u32);
+            }
+            map
+        })
+    }
+
+    /// Look up the (cheapest) dictionary word id whose surface is exactly `surface`, if any.
+    pub fn surface_to_id(&self, surface: &str) -> Option<u32> {
+        self.surface_index().get(surface).copied()
+    }
+
+    /// Greedy longest-match tokenization of a committed Chinese surface into dictionary word ids.
+    /// At each position prefer the longest hanzi prefix (up to `MAX_TOK_CHARS`) that is a known
+    /// dictionary word; fall back to the single leading character if no longer word exists; skip any
+    /// character with no dictionary entry (e.g. punctuation / latin). Returns the ids in surface
+    /// order. Used by `UserModel::record` to bump per-word unigram/bigram counts.
+    pub fn tokenize_surface(&self, surface: &str) -> Vec<u32> {
+        const MAX_TOK_CHARS: usize = 6;
+        let chars: Vec<char> = surface.chars().collect();
+        let n = chars.len();
+        let mut ids = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let mut matched: Option<(u32, usize)> = None;
+            let hi = (i + MAX_TOK_CHARS).min(n);
+            for end in (i + 1..=hi).rev() {
+                let cand: String = chars[i..end].iter().collect();
+                if let Some(id) = self.surface_to_id(&cand) {
+                    matched = Some((id, end - i));
+                    break;
+                }
+            }
+            match matched {
+                Some((id, len)) => {
+                    ids.push(id);
+                    i += len;
+                }
+                None => {
+                    // No dictionary entry even for the single char: skip it (no LM identity).
+                    i += 1;
+                }
+            }
+        }
+        ids
     }
 
     /// True if `w` (lowercased) is in the English vocabulary.

@@ -3,7 +3,8 @@
 //! This file defines the STABLE public API contract (see ../../DESIGN.md). The CORE agent
 //! implements the modules below. Other crates depend only on the items re-exported here.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 pub mod format;
 pub mod fuzzy;
@@ -12,8 +13,10 @@ pub mod segment;
 pub mod lexicon;
 pub mod lm;
 pub mod decoder;
+pub mod user;
 
 pub use fuzzy::FuzzySet;
+pub use user::UserModel;
 
 /// Shared cost/scaling constants (see DESIGN.md).
 pub mod consts {
@@ -77,6 +80,10 @@ pub struct EngineConfig {
     pub enable_english: bool,
     pub max_candidates: usize,
     pub beam_width: usize,
+    /// Strength of online personalization from the attached user model. `0` disables it entirely
+    /// (results are byte-identical to no user model); the raw bonus formula is applied at
+    /// `user::USER_WEIGHT_STD` and scaled linearly by `user_weight / USER_WEIGHT_STD`.
+    pub user_weight: i32,
 }
 
 impl Default for EngineConfig {
@@ -88,6 +95,7 @@ impl Default for EngineConfig {
             enable_english: true,
             max_candidates: 20,
             beam_width: 20,
+            user_weight: user::USER_WEIGHT_STD,
         }
     }
 }
@@ -96,6 +104,12 @@ impl Default for EngineConfig {
 pub struct Engine {
     pub(crate) lexicon: lexicon::Lexicon,
     pub(crate) lm: lm::LanguageModel,
+    /// Optional online personalization. `convert`/`predict` read it via a read-lock; `commit`
+    /// write-locks. `RwLock<Option<…>>` keeps `Engine: Sync` so the rayon eval sweep can share
+    /// `&Engine` across threads. `None` ⇒ no user model attached (zero overhead, no behavior change).
+    pub(crate) user: RwLock<Option<UserModel>>,
+    /// Where the user model is persisted (set by `with_user_model`). `None` ⇒ `save_user` is a no-op.
+    pub(crate) user_path: RwLock<Option<PathBuf>>,
 }
 
 impl Engine {
@@ -103,7 +117,47 @@ impl Engine {
     pub fn load(data_dir: &Path) -> anyhow::Result<Engine> {
         let lexicon = lexicon::Lexicon::load(data_dir)?;
         let lm = lm::LanguageModel::load(data_dir)?;
-        Ok(Engine { lexicon, lm })
+        Ok(Engine {
+            lexicon,
+            lm,
+            user: RwLock::new(None),
+            user_path: RwLock::new(None),
+        })
+    }
+
+    /// Attach a user model for online personalization, loading prior history from `path` if it
+    /// exists. `path == None` attaches a fresh, empty (and unpersisted) model. The decoder reads the
+    /// model during `convert`/`predict`; `commit` updates it; `save_user` persists it.
+    pub fn with_user_model(self, path: Option<PathBuf>) -> Engine {
+        let model = match &path {
+            Some(p) => UserModel::load(p).unwrap_or_else(|_| UserModel::new()),
+            None => UserModel::new(),
+        };
+        *self.user.write().unwrap() = Some(model);
+        *self.user_path.write().unwrap() = path;
+        self
+    }
+
+    /// Learn from a committed selection: input buffer → chosen output. Tokenizes `chosen` against
+    /// the base lexicon (longest-match) to bump per-word unigram/bigram counts, and stores the whole
+    /// `(normalized_input → chosen)` as a user phrase (auto-learning new words/phrases). Interior
+    /// mutability: takes `&self` and write-locks. A no-op if no user model is attached.
+    pub fn commit(&self, input: &str, chosen: &str) {
+        let mut guard = self.user.write().unwrap();
+        let Some(model) = guard.as_mut() else { return };
+        let word_ids = self.lexicon.tokenize_surface(chosen);
+        model.record(input, chosen, &word_ids);
+    }
+
+    /// Persist the user model to its path. No-op (Ok) when no model / no path is attached.
+    pub fn save_user(&self) -> anyhow::Result<()> {
+        let path_guard = self.user_path.read().unwrap();
+        let Some(path) = path_guard.as_ref() else { return Ok(()) };
+        let guard = self.user.read().unwrap();
+        if let Some(model) = guard.as_ref() {
+            model.save(path)?;
+        }
+        Ok(())
     }
 
     /// Convert a raw input buffer into ranked candidates (best first).
