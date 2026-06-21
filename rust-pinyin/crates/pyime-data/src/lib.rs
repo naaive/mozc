@@ -71,35 +71,33 @@ fn log_ratio_cost(p_cond: f64, p_uni: f64) -> i32 {
 const MAX_WORDS: usize = 700_000;
 /// Cap on English vocabulary size (frequency-ranked first).
 const MAX_ENGLISH: usize = 60_000;
-/// Drop word-bigram pairs observed fewer than this many times. With multiple
-/// large corpora, low-count pairs are mostly noise that displaces good candidates.
-const BIGRAM_MIN_COUNT: u32 = 5;
-/// Drop word-trigram triples observed fewer than this many times. The absolute-discounting
-/// smoothing keeps rare triples from overfitting, so we can afford a moderate floor (raising it
-/// further only loses recall); the log-ratio formulation is what actually tames the noise.
+/// Drop word-bigram pairs observed fewer than this many times. With proper modified-Kneser-Ney
+/// smoothing (continuation-count lower orders + per-tier discounts) low-count pairs are now
+/// well-calibrated rather than noise, so we lightly densify from 5 to 3 — keeping more
+/// genuinely-repeated pairs. (Bigram densification proved eval-neutral; the smoothing is the win.)
+const BIGRAM_MIN_COUNT: u32 = 3;
+/// Drop word-trigram triples observed fewer than this many times. We TESTED densifying this down to
+/// 2 (inventory grew ~18×, to ~866k), but on BOTH gold sets that *regressed* gold.jsonl `full`
+/// (0.628→0.622) because the flood of count<8 shopping-domain triples reranked some clean full-pinyin
+/// parses wrongly — gold_v2 gained less than modified-KN alone already gives. So the floor stays at 8:
+/// modified-KN *smoothing quality* (not raw inventory size) is what moves the metric here, and 8 is
+/// empirically optimal on both gold sets. Lower it only if a future, more in-domain corpus is added.
 const TRIGRAM_MIN_COUNT: u32 = 8;
-/// Drop word-4-gram quadruples observed fewer than this many times. 4-grams explode
-/// combinatorially and are far sparser than trigrams, so we use a noticeably higher floor than the
-/// trigram: most 4-grams seen 1–5 times are corpus-specific noise. This keeps `fourgram.fst` small
-/// (well within the 80 MB total budget) while retaining the genuinely-repeated long contexts.
-/// Tuned to 7, deliberately ONE ABOVE `SHOPPING_WEIGHT` (6): a 4-gram seen exactly once in the
-/// in-domain shopping corpus contributes weight 6, so a floor of 7 excludes single-shopping-
-/// occurrence 4-grams (the noisiest, most overfit tier — there is a huge count==6 spike of them)
-/// while keeping any 4-gram with a genuine *second* observation (or ≥7 general-corpus hits). This
-/// mirrors the trigram floor sitting just above the single-occurrence tier. Empirically the count
-/// distribution has a cliff at 6: floor 6 → ~466k quads / ~9.4 MB FST, floor 7 → ~19k quads /
-/// ~0.46 MB FST (total ~51 MB). 7 captures the repeated long contexts without the single-obs noise.
+/// Drop word-4-gram quadruples observed fewer than this many times. Same finding as the trigram:
+/// densifying to 2 (→~575k quads, ~12 MB FST) regressed gold.jsonl `full`; the count==6 single-
+/// shopping-occurrence spike (see `SHOPPING_WEIGHT`) is overfit noise that hurts reranking. The floor
+/// stays at 7 (just above that spike) — modified-KN already calibrates the surviving high-count quads
+/// well. 7 keeps `fourgram.fst` small and the total `data/` ~52 MB; raise it first if budget is hit.
 const FOURGRAM_MIN_COUNT: u32 = 7;
 
-/// Absolute-discounting constant `D` for the **bigram** model `P(w3|w2)`. Subtracted from each
-/// observed count; the freed mass is redistributed to the unigram via interpolation. ~0.75 is the
-/// standard Kneser-Ney/absolute-discounting value and works well empirically here.
+/// FALLBACK single discount `D` for the **bigram** model `P(w3|w2)`, used only when the
+/// count-of-counts needed for the modified-KN D1/D2/D3+ formulas is degenerate. In the normal path
+/// the three-tier modified-KN discounts (derived from n1..n4) replace this. ~0.75 is the standard
+/// absolute-discounting value.
 const BIGRAM_DISCOUNT: f64 = 0.75;
-/// Absolute-discounting constant `D` for the **trigram** model `P(w3|w1,w2)` (back-off to bigram).
+/// FALLBACK single discount `D` for the **trigram** model `P(w3|w1,w2)` (modified-KN normally).
 const TRIGRAM_DISCOUNT: f64 = 1.0;
-/// Absolute-discounting constant `D` for the **4-gram** model `P(w3|w0,w1,w2)` (back-off to the
-/// smoothed trigram). Same value as the trigram order: 4-gram counts are small, so a full-unit
-/// discount keeps the higher-order term from overfitting the few contexts that survive pruning.
+/// FALLBACK single discount `D` for the **4-gram** model `P(w3|w0,w1,w2)` (modified-KN normally).
 const FOURGRAM_DISCOUNT: f64 = 1.0;
 /// Clamp for the SIGNED log-ratio LM costs (transition = `-500·ln[P(w|ctx)/P(w)]`). The ratio is
 /// bounded both ways: a hugely-boosted n-gram cannot drop the path by more than this, and a
@@ -377,8 +375,9 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
          + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words \
          + google-10000-english + toutiao-news-titles + online-shopping; \
          LM=word bi/tri/4-gram over toutiao+shopping (longest-match tokenization, T->S normalized), \
-         absolute-discounting interpolation (bi D={BIGRAM_DISCOUNT}, tri D={TRIGRAM_DISCOUNT}, \
-         4-gram D={FOURGRAM_DISCOUNT}), signed log-ratio costs; \
+         modified-kneser-ney interpolation (per-order D1/D2/D3+ from count-of-counts; \
+         continuation-count lower orders incl. unigram base; fallback single D bi={BIGRAM_DISCOUNT}/\
+         tri={TRIGRAM_DISCOUNT}/4-gram={FOURGRAM_DISCOUNT}), signed log-ratio costs; \
          min-count bi={BIGRAM_MIN_COUNT}/tri={TRIGRAM_MIN_COUNT}/4-gram={FOURGRAM_MIN_COUNT}; {}",
         notes.join(", ")
     );
@@ -864,58 +863,220 @@ fn build_and_write_ngrams(
         }
     }
 
-    // --- smoothing statistics ----------------------------------------------
-    // Absolute discounting + interpolation needs, besides the raw counts:
-    //   * total token count           -> unigram P(w) = c1(w)/total
-    //   * N1+(w2•)  = #distinct words following w2     (bigram continuation diversity)
-    //   * N1+(w1,w2•) = #distinct words following (w1,w2) (trigram continuation diversity)
-    // We derive the continuation-diversity maps from the *full* count tables (BEFORE min-count
-    // pruning) so the interpolation weights λ reflect the true distribution, not the pruned subset.
+    // --- MODIFIED KNESER-NEY smoothing (Chen & Goodman 1998) ---------------
+    // We build, for the bigram/trigram/4-gram orders that the engine emits, an *interpolated*
+    // modified-KN model where the HIGHEST emitted order uses raw counts and ALL lower orders use
+    // KN CONTINUATION counts (how many distinct contexts a suffix follows). Three pieces are needed:
+    //
+    //   1. Per-order modified discounts D1/D2/D3+ from the count-of-counts n1,n2,n3,n4:
+    //        Y = n1/(n1+2·n2)
+    //        D1 = 1 − 2Y·n2/n1 ,  D2 = 2 − 3Y·n3/n2 ,  D3+ = 3 − 4Y·n4/n3
+    //      with D(c) = 0 (c=0), D1 (c=1), D2 (c=2), D3+ (c≥3). If any count-of-counts is degenerate
+    //      we fall back to a single absolute-discounting constant for that order.
+    //
+    //   2. Continuation counts for the lower orders:
+    //        unigram: N1+(•w)  = #distinct words preceding w ; Pcont(w) = N1+(•w)/N1+(••)
+    //        bigram : N1+(•w2,w3) = #distinct w1 before (w2,w3) ; ctx N1+(•w2•)=#distinct (w1,w3)
+    //        trigram: N1+(•w1,w2,w3) = #distinct w0 before ; ctx N1+(•w1,w2•)=#distinct (w0,w3)
+    //
+    //   3. The modified-KN normalization γ(ctx) = (D1·N1(ctx)+D2·N2(ctx)+D3+·N3+(ctx))/c(ctx),
+    //      where N1/N2/N3+ count how many continuation types in that context have count 1/2/≥3.
+    //
+    // All maps are derived from the FULL count tables (BEFORE min-count pruning) so the smoothing
+    // reflects the true distribution, not the pruned subset.
     let total_tokens: f64 = uni_counts.values().map(|&c| c as f64).sum::<f64>().max(1.0);
-    let mut bi_distinct: FxHashMap<u32, u32> = FxHashMap::default(); // w2 -> #distinct w3
-    for &(w2, _w3) in bi_counts.keys() {
-        *bi_distinct.entry(w2).or_insert(0) += 1;
+
+    // --- modified-KN discounts per order (from count-of-counts) -------------
+    // Returns (D1, D2, D3plus). `fallback` is the single-discount value used when the
+    // count-of-counts is degenerate (any of n1..n3 zero) so Y/D are ill-defined.
+    fn modkn_discounts(coc: &[u64; 5], fallback: f64) -> (f64, f64, f64) {
+        let (n1, n2, n3, n4) = (coc[1] as f64, coc[2] as f64, coc[3] as f64, coc[4] as f64);
+        if n1 <= 0.0 || n2 <= 0.0 || n3 <= 0.0 || n4 <= 0.0 {
+            return (fallback, fallback, fallback);
+        }
+        let y = n1 / (n1 + 2.0 * n2);
+        let d1 = 1.0 - 2.0 * y * n2 / n1;
+        let d2 = 2.0 - 3.0 * y * n3 / n2;
+        let d3 = 3.0 - 4.0 * y * n4 / n3;
+        // Clamp to sane ranges (D1∈[0,1], D2∈[0,2], D3+∈[0,3]); fall back per-tier if degenerate.
+        let d1 = if d1.is_finite() && d1 > 0.0 { d1.min(1.0) } else { fallback };
+        let d2 = if d2.is_finite() && d2 > 0.0 { d2.min(2.0) } else { fallback };
+        let d3 = if d3.is_finite() && d3 > 0.0 { d3.min(3.0) } else { fallback };
+        (d1, d2, d3)
     }
-    let mut tri_distinct: FxHashMap<(u32, u32), u32> = FxHashMap::default(); // (w1,w2) -> #distinct w3
-    for &(w1, w2, _w3) in tri_counts.keys() {
-        *tri_distinct.entry((w1, w2)).or_insert(0) += 1;
-    }
-    // N1+(w0,w1,w2•) = #distinct words following the context (w0,w1,w2) (4-gram continuation
-    // diversity), derived from the FULL 4-gram table before min-count pruning.
-    let mut four_distinct: FxHashMap<(u32, u32, u32), u32> = FxHashMap::default();
-    for &(w0, w1, w2, _w3) in four_counts.keys() {
-        *four_distinct.entry((w0, w1, w2)).or_insert(0) += 1;
+    #[inline]
+    fn disc(c: f64, d1: f64, d2: f64, d3: f64) -> f64 {
+        if c <= 0.0 { 0.0 } else if c < 1.5 { d1 } else if c < 2.5 { d2 } else { d3 }
     }
 
-    // Smoothed unigram probability P(w) = c1(w)/total.
-    let uni_p = |w: u32| -> f64 {
+    // count-of-counts for the (raw) bigram, trigram, 4-gram tables (index = count, 1..=4).
+    let mut bi_coc = [0u64; 5];
+    for &c in bi_counts.values() {
+        if (1..=4).contains(&c) { bi_coc[c as usize] += 1; }
+    }
+    let mut tri_coc = [0u64; 5];
+    for &c in tri_counts.values() {
+        if (1..=4).contains(&c) { tri_coc[c as usize] += 1; }
+    }
+    let mut four_coc = [0u64; 5];
+    for &c in four_counts.values() {
+        if (1..=4).contains(&c) { four_coc[c as usize] += 1; }
+    }
+    let (bi_d1, bi_d2, bi_d3) = modkn_discounts(&bi_coc, BIGRAM_DISCOUNT);
+    let (tri_d1, tri_d2, tri_d3) = modkn_discounts(&tri_coc, TRIGRAM_DISCOUNT);
+    let (four_d1, four_d2, four_d3) = modkn_discounts(&four_coc, FOURGRAM_DISCOUNT);
+    eprintln!(
+        "  modified-KN discounts: bigram D1={bi_d1:.3} D2={bi_d2:.3} D3+={bi_d3:.3} | \
+         trigram D1={tri_d1:.3} D2={tri_d2:.3} D3+={tri_d3:.3} | \
+         4-gram D1={four_d1:.3} D2={four_d2:.3} D3+={four_d3:.3}"
+    );
+
+    // --- continuation counts: UNIGRAM (KN base distribution) ---------------
+    // N1+(•w) = #distinct predecessors of w  (= #distinct bigram TYPES ending in w).
+    // N1+(••) = total #distinct bigram types (= the normalizer of Pcont).
+    let mut uni_cont: FxHashMap<u32, u32> = FxHashMap::default();
+    for &(_w1, w2) in bi_counts.keys() {
+        *uni_cont.entry(w2).or_insert(0) += 1;
+    }
+    let uni_cont_total: f64 = bi_counts.len().max(1) as f64; // = Σ_w N1+(•w)
+
+    // --- continuation counts: BIGRAM (lower order for the trigram/4-gram) ---
+    // cc_bi(w2,w3) = N1+(•w2,w3) = #distinct w1 preceding (w2,w3) = #distinct trigram types
+    //               ending in (w2,w3). ctx cc_bi_ctx(w2) = N1+(•w2•) = Σ_w3 cc_bi(w2,w3).
+    // We also need, per context w2, how many continuation types have cc==1, ==2, ≥3 (for γ).
+    let mut cc_bi: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+    for &(_w1, w2, w3) in tri_counts.keys() {
+        *cc_bi.entry((w2, w3)).or_insert(0) += 1;
+    }
+    let mut cc_bi_ctx: FxHashMap<u32, f64> = FxHashMap::default(); // w2 -> Σ cc
+    let mut cc_bi_n: FxHashMap<u32, [u32; 3]> = FxHashMap::default(); // w2 -> [N1,N2,N3+]
+    for (&(w2, _w3), &cc) in cc_bi.iter() {
+        *cc_bi_ctx.entry(w2).or_insert(0.0) += cc as f64;
+        let n = cc_bi_n.entry(w2).or_insert([0, 0, 0]);
+        match cc { 1 => n[0] += 1, 2 => n[1] += 1, _ => n[2] += 1 }
+    }
+
+    // --- continuation counts: TRIGRAM (lower order for the 4-gram) ----------
+    // cc_tri(w1,w2,w3) = N1+(•w1,w2,w3) = #distinct w0 preceding = #distinct 4-gram types ending
+    // in (w1,w2,w3). ctx cc_tri_ctx(w1,w2) = N1+(•w1,w2•) = Σ_w3 cc_tri.
+    let mut cc_tri: FxHashMap<(u32, u32, u32), u32> = FxHashMap::default();
+    for &(_w0, w1, w2, w3) in four_counts.keys() {
+        *cc_tri.entry((w1, w2, w3)).or_insert(0) += 1;
+    }
+    let mut cc_tri_ctx: FxHashMap<(u32, u32), f64> = FxHashMap::default();
+    let mut cc_tri_n: FxHashMap<(u32, u32), [u32; 3]> = FxHashMap::default();
+    for (&(w1, w2, _w3), &cc) in cc_tri.iter() {
+        *cc_tri_ctx.entry((w1, w2)).or_insert(0.0) += cc as f64;
+        let n = cc_tri_n.entry((w1, w2)).or_insert([0, 0, 0]);
+        match cc { 1 => n[0] += 1, 2 => n[1] += 1, _ => n[2] += 1 }
+    }
+
+    // --- HIGHEST-ORDER context diversity (raw counts), for γ of each emitted order ----------
+    // bigram order: ctx=w2, raw count c1(w2)=uni_counts[w2]; continuation types = distinct w3 with
+    // their raw bigram counts -> need N1/N2/N3+ of those raw bigram counts per w2.
+    let mut bi_n: FxHashMap<u32, [u32; 3]> = FxHashMap::default();
+    for (&(w2, _w3), &c) in bi_counts.iter() {
+        let n = bi_n.entry(w2).or_insert([0, 0, 0]);
+        match c { 1 => n[0] += 1, 2 => n[1] += 1, _ => n[2] += 1 }
+    }
+    // trigram order: ctx=(w1,w2), raw count c2(w1,w2)=bi_counts; N1/N2/N3+ over raw trigram counts.
+    let mut tri_n: FxHashMap<(u32, u32), [u32; 3]> = FxHashMap::default();
+    for (&(w1, w2, _w3), &c) in tri_counts.iter() {
+        let n = tri_n.entry((w1, w2)).or_insert([0, 0, 0]);
+        match c { 1 => n[0] += 1, 2 => n[1] += 1, _ => n[2] += 1 }
+    }
+    // 4-gram order: ctx=(w0,w1,w2), raw count c3(w0,w1,w2)=tri_counts; N1/N2/N3+ over raw 4-gram cnt.
+    let mut four_n: FxHashMap<(u32, u32, u32), [u32; 3]> = FxHashMap::default();
+    for (&(w0, w1, w2, _w3), &c) in four_counts.iter() {
+        let n = four_n.entry((w0, w1, w2)).or_insert([0, 0, 0]);
+        match c { 1 => n[0] += 1, 2 => n[1] += 1, _ => n[2] += 1 }
+    }
+
+    #[inline]
+    fn gamma(n: &[u32; 3], ctx_count: f64, d1: f64, d2: f64, d3: f64) -> f64 {
+        if ctx_count <= 0.0 { return 0.0; }
+        (d1 * n[0] as f64 + d2 * n[1] as f64 + d3 * n[2] as f64) / ctx_count
+    }
+
+    // --- KN base: unigram continuation probability Pcont(w) = N1+(•w)/N1+(••) ----------------
+    // This is the base of the KN backoff RECURSION (used by the lower-order continuation
+    // distributions). Falls back to the raw-MLE unigram for words with no continuation evidence.
+    let uni_cont_p = |w: u32| -> f64 {
+        let cont = *uni_cont.get(&w).unwrap_or(&0) as f64;
+        if cont > 0.0 {
+            cont / uni_cont_total
+        } else {
+            (*uni_counts.get(&w).unwrap_or(&0) as f64) / total_tokens
+        }
+    };
+    // --- log-ratio DENOMINATOR -------------------------------------------------------------------
+    // The stored cost is the SIGNED log-ratio -500·ln[P(w|ctx)/P(w)]. Per the consistent-KN design,
+    // the denominator P(w) is the unigram CONTINUATION probability `uni_cont_p` (same base the
+    // recursion uses) — NOT the raw MLE. The decoder's unigram word-edge already pays -500·ln P_mle,
+    // so the stored cost effectively folds the per-word P_mle/P_cont reweighting into the transition.
+    // Empirically (gold_v2 OVERALL +0.008, full +0.011, long +0.010) this calibrated reweighting —
+    // which down-weights high-frequency-but-low-diversity words — beats the raw-MLE denominator,
+    // which was flat vs. baseline. The raw-MLE variant is `uni_mle_p` below, kept for reference.
+    #[allow(unused)]
+    let uni_mle_p = |w: u32| -> f64 {
         (*uni_counts.get(&w).unwrap_or(&0) as f64) / total_tokens
     };
-    // Smoothed bigram P(w3|w2) = max(c2-D,0)/c1(w2) + λ(w2)·P(w3),
-    // with λ(w2) = D·N1+(w2•)/c1(w2). Falls back to the unigram when w2 is unseen.
+
+    // --- bigram CONTINUATION distribution Pcont(w3|w2) (lower order for tri/4-gram) ----------
+    // Uses modified-KN over the bigram continuation counts cc_bi:
+    //   Pcont(w3|w2) = max(cc − D(cc),0)/cc_ctx(w2) + γ_bi(w2)·Pcont(w3).
+    let bi_cont_p = |w2: u32, w3: u32| -> f64 {
+        let p_low = uni_cont_p(w3);
+        let ctx = *cc_bi_ctx.get(&w2).unwrap_or(&0.0);
+        if ctx <= 0.0 {
+            return p_low;
+        }
+        let cc = *cc_bi.get(&(w2, w3)).unwrap_or(&0) as f64;
+        let n = cc_bi_n.get(&w2).copied().unwrap_or([0, 0, 0]);
+        let g = gamma(&n, ctx, bi_d1, bi_d2, bi_d3);
+        (cc - disc(cc, bi_d1, bi_d2, bi_d3)).max(0.0) / ctx + g * p_low
+    };
+
+    // --- bigram HIGHEST-ORDER distribution P(w3|w2) (emitted as bigram.fst) ------------------
+    // Modified-KN over RAW bigram counts, backing off to the unigram continuation Pcont(w3).
+    //   P(w3|w2) = max(c2 − D(c2),0)/c1(w2) + γ(w2)·Pcont(w3).
     let bi_p = |w2: u32, w3: u32, c2: f64| -> f64 {
         let c_w2 = *uni_counts.get(&w2).unwrap_or(&0) as f64;
-        let p_uni = uni_p(w3);
+        let p_low = uni_cont_p(w3);
         if c_w2 <= 0.0 {
-            return p_uni;
+            return p_low;
         }
-        let n1 = *bi_distinct.get(&w2).unwrap_or(&0) as f64;
-        let lambda = BIGRAM_DISCOUNT * n1 / c_w2;
-        ((c2 - BIGRAM_DISCOUNT).max(0.0)) / c_w2 + lambda * p_uni
+        let n = bi_n.get(&w2).copied().unwrap_or([0, 0, 0]);
+        let g = gamma(&n, c_w2, bi_d1, bi_d2, bi_d3);
+        (c2 - disc(c2, bi_d1, bi_d2, bi_d3)).max(0.0) / c_w2 + g * p_low
     };
-    // Smoothed trigram P(w3|w1,w2) = max(c3-D,0)/c2(w1,w2) + λ(w1,w2)·P_bigram(w3|w2),
-    // with λ(w1,w2) = D·N1+(w1,w2•)/c2(w1,w2). `c3` is the raw count of (w1,w2,w3). Falls back to
-    // the smoothed bigram when the context (w1,w2) is unseen. Shared by the trigram emission below
-    // AND the 4-gram interpolation (which backs off onto this exact lower-order estimate).
+
+    // --- trigram CONTINUATION distribution Pcont(w3|w1,w2) (lower order for the 4-gram) ------
+    // Modified-KN over the trigram continuation counts cc_tri, backing off to bi_cont_p.
+    let tri_cont_p = |w1: u32, w2: u32, w3: u32| -> f64 {
+        let p_low = bi_cont_p(w2, w3);
+        let ctx = *cc_tri_ctx.get(&(w1, w2)).unwrap_or(&0.0);
+        if ctx <= 0.0 {
+            return p_low;
+        }
+        let cc = *cc_tri.get(&(w1, w2, w3)).unwrap_or(&0) as f64;
+        let n = cc_tri_n.get(&(w1, w2)).copied().unwrap_or([0, 0, 0]);
+        let g = gamma(&n, ctx, tri_d1, tri_d2, tri_d3);
+        (cc - disc(cc, tri_d1, tri_d2, tri_d3)).max(0.0) / ctx + g * p_low
+    };
+
+    // --- trigram HIGHEST-ORDER distribution P(w3|w1,w2) (emitted as trigram.fst) -------------
+    // Modified-KN over RAW trigram counts, backing off to the bigram CONTINUATION Pcont(w3|w2).
+    // `c3` is the raw count of (w1,w2,w3). Falls back to the bigram continuation when (w1,w2) unseen.
     let tri_p = |w1: u32, w2: u32, w3: u32, c3: f64| -> f64 {
         let c2 = *bi_counts.get(&(w1, w2)).unwrap_or(&0) as f64;
-        let p_bi = bi_p(w2, w3, *bi_counts.get(&(w2, w3)).unwrap_or(&0) as f64);
+        let p_low = bi_cont_p(w2, w3);
         if c2 <= 0.0 {
-            return p_bi;
+            return p_low;
         }
-        let n1 = *tri_distinct.get(&(w1, w2)).unwrap_or(&0) as f64;
-        let lambda = TRIGRAM_DISCOUNT * n1 / c2;
-        ((c3 - TRIGRAM_DISCOUNT).max(0.0)) / c2 + lambda * p_bi
+        let n = tri_n.get(&(w1, w2)).copied().unwrap_or([0, 0, 0]);
+        let g = gamma(&n, c2, tri_d1, tri_d2, tri_d3);
+        (c3 - disc(c3, tri_d1, tri_d2, tri_d3)).max(0.0) / c2 + g * p_low
     };
 
     // --- bigram.fst (signed log-ratio: -500·ln[P(w3|w2)/P(w3)]) -------------
@@ -938,7 +1099,7 @@ fn build_and_write_ngrams(
     let mut n_bigrams: u64 = 0;
     for &((prev, id), count) in &pairs {
         let p_cond = bi_p(prev, id, count as f64);
-        let p_uni = uni_p(id);
+        let p_uni = uni_cont_p(id);
         let cost = log_ratio_cost(p_cond, p_uni);
         bb.insert(pyime_core::format::bigram_key(prev, id), pyime_core::lm::encode_cost(cost))
             .context("bigram insert")?;
@@ -972,7 +1133,7 @@ fn build_and_write_ngrams(
     let mut n_trigrams: u64 = 0;
     for &((w1, w2, w3), count) in &triples {
         let p_cond = tri_p(w1, w2, w3, count as f64);
-        let p_uni = uni_p(w3);
+        let p_uni = uni_cont_p(w3);
         let cost = log_ratio_cost(p_cond, p_uni);
         tb.insert(pyime_core::format::trigram_key(w1, w2, w3), pyime_core::lm::encode_cost(cost))
             .context("trigram insert")?;
@@ -981,10 +1142,10 @@ fn build_and_write_ngrams(
     tb.finish().context("trigram finish")?;
 
     // --- fourgram.fst (signed log-ratio: -500·ln[P(w3|w0,w1,w2)/P(w3)]) ----
-    // P(w3|w0,w1,w2) = max(c4-D,0)/c3(w0,w1,w2) + λ(w0,w1,w2)·P_trigram(w3|w1,w2),
-    // with λ(w0,w1,w2) = D·N1+(w0,w1,w2•)/c3(w0,w1,w2). The 4-gram REFINES the (already smoothed)
-    // trigram on the SAME log-ratio scale — exactly one order above the trigram, mirroring how the
-    // trigram refines the bigram. `c3(w0,w1,w2)` is the raw trigram count of the context.
+    // Modified-KN, highest emitted order = 4: P(w3|w0,w1,w2) = max(c4 − D(c4),0)/c3(w0,w1,w2)
+    //   + γ(w0,w1,w2)·Pcont_trigram(w3|w1,w2), with the modified-KN γ over the raw 4-gram counts in
+    // this context and the lower order being the trigram CONTINUATION distribution. `c3(w0,w1,w2)`
+    // is the raw trigram count of the context. Refines the trigram one order up on the same scale.
     let mut quads: Vec<((u32, u32, u32, u32), u32)> = four_counts
         .iter()
         .filter(|&(_, &c)| c >= FOURGRAM_MIN_COUNT)
@@ -1007,16 +1168,16 @@ fn build_and_write_ngrams(
     let mut n_fourgrams: u64 = 0;
     for &((w0, w1, w2, w3), count) in &quads {
         let c3 = *tri_counts.get(&(w0, w1, w2)).unwrap_or(&0) as f64;
-        // Lower-order term: the SMOOTHED trigram P(w3|w1,w2) (uses the raw c3(w1,w2,w3) count).
-        let p_tri = tri_p(w1, w2, w3, *tri_counts.get(&(w1, w2, w3)).unwrap_or(&0) as f64);
+        // Lower-order term: the trigram CONTINUATION distribution Pcont(w3|w1,w2).
+        let p_low = tri_cont_p(w1, w2, w3);
         let p_cond = if c3 > 0.0 {
-            let n1 = *four_distinct.get(&(w0, w1, w2)).unwrap_or(&0) as f64;
-            let lambda = FOURGRAM_DISCOUNT * n1 / c3;
-            ((count as f64 - FOURGRAM_DISCOUNT).max(0.0)) / c3 + lambda * p_tri
+            let n = four_n.get(&(w0, w1, w2)).copied().unwrap_or([0, 0, 0]);
+            let g = gamma(&n, c3, four_d1, four_d2, four_d3);
+            (count as f64 - disc(count as f64, four_d1, four_d2, four_d3)).max(0.0) / c3 + g * p_low
         } else {
-            p_tri
+            p_low
         };
-        let p_uni = uni_p(w3);
+        let p_uni = uni_cont_p(w3);
         let cost = log_ratio_cost(p_cond, p_uni);
         fb.insert(
             pyime_core::format::fourgram_key(w0, w1, w2, w3),

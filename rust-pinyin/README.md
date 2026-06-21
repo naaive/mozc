@@ -39,8 +39,8 @@ input ─▶ normalize ─▶ syllable lattice ─▶ word lattice (FST walk) �
   initials), and interleaved English sub-spans for mixed input.
 - **Language model** (`lm.rs`): word **unigram + bigram + trigram (+ 4-gram rescoring)** with **stupid-backoff**.
   Costs are the **signed log-ratio of the conditional over the unigram**
-  (`-500·ln[P(w₃|ctx)/P(w₃)]`) estimated with **absolute-discounting interpolation**
-  (modified-Kneser-Ney style), so the trigram *refines* the bigram on one comparable scale
+  (`-500·ln[P(w₃|ctx)/P(w₃)]`) estimated with **modified Kneser-Ney** smoothing
+  (three-tier discounts + continuation probabilities), so the trigram *refines* the bigram on one comparable scale
   instead of overpowering it. Trigram/bigram tables are `fst::Map`s (mmap), unigram is in the
   word table.
 - **Decoder** (`decoder.rs`): **trigram beam search**, state `(position, w_prev, w_prevprev)`,
@@ -73,10 +73,10 @@ Built entirely from **freely-available, GitHub-hosted** sources (see `data/meta.
   composition mangles polyphones (银行→`yinhang` not `yinxing`); rime-ice fixes it.
 - **Language model** — a word **trigram** built from a general-domain news-title corpus
   (Toutiao, ~2.1M segments) unioned with shopping reviews, tokenized by longest-match over the
-  lexicon, smoothed with absolute-discounting interpolation.
+  lexicon, smoothed with **modified Kneser-Ney** (three-tier discounts + KN continuation probabilities).
 - **English** — a frequency-ranked list (`google-10000-english` ∪ `dwyl/english-words`, 60k).
 
-Counts: ~700k words / ~583k readings / ~734k bigrams / ~49k trigrams / ~19k 4-grams / 60k English.
+Counts: ~700k words / ~583k readings / ~835k bigrams / ~49k trigrams / ~19k 4-grams / 60k English.
 
 **Footprint:** release binary **~3 MB** + `data/` **~49 MB** = **~52 MB total**, well under the
 100 MB budget (data is mmap'd separately, not embedded).
@@ -127,17 +127,17 @@ and on-disk data size. Output is a human-readable table **and** `report.json`.
 ```
 bucket              n    top1    top5   top10     mrr char_acc     cer coverage
 -------------------------------------------------------------------------------
-full              600   0.627   0.813   0.862   0.710    0.894   0.106    0.875
-abbr              599   0.092   0.235   0.307   0.155    0.145   0.855    0.387
-fuzzy             600   0.517   0.712   0.768   0.604    0.855   0.145    0.803
-typo              600   0.327   0.443   0.477   0.371    0.749   0.251    0.513
+full              600   0.628   0.815   0.860   0.713    0.896   0.104    0.875
+abbr              599   0.092   0.245   0.322   0.158    0.145   0.855    0.389
+fuzzy             600   0.522   0.718   0.768   0.610    0.860   0.140    0.798
+typo              600   0.328   0.450   0.478   0.374    0.754   0.246    0.525
 english            40   1.000   1.000   1.000   1.000    1.000   0.000    1.000
-mixed             257   0.658   0.802   0.829   0.720    0.885   0.115    0.837
-long_sentence     600   0.593   0.785   0.832   0.678    0.910   0.090    0.848
-short_word        111   0.748   0.937   0.982   0.827    0.811   0.189    0.982
+mixed             257   0.661   0.802   0.829   0.723    0.887   0.113    0.837
+long_sentence     600   0.595   0.785   0.832   0.681    0.911   0.089    0.847
+short_word        111   0.757   0.937   0.973   0.834    0.815   0.185    0.982
 -------------------------------------------------------------------------------
-OVERALL          3407   0.465   0.629   0.678   0.536    0.730   0.270    0.710
-Latency: p50 9.4ms  p95 22.7ms   |   RSS 38 MiB   |   data 50 MiB
+OVERALL          3407   0.468   0.633   0.680   0.540    0.733   0.267    0.711
+Latency: p50 8.1ms  p95 19.1ms   |   RSS 38 MiB   |   data 51 MiB
 ```
 
 ### How it got there — quantified improvement per stage
@@ -156,7 +156,8 @@ The engine was tuned **using the eval harness as the objective function**. OVERA
 | **literal-demotion** | 0.460 | 0.620 | 0.695 | 0.612 | typo 0.10→0.33 |
 | **简拼 word-boost** | 0.463 | 0.621 | 0.698 | 0.612 | kyi→可以, bj→北京 #1 |
 | **繁→简归一化** | 0.459 | 0.632 | 0.710 | 0.613 | OpenCC T2S; top5/coverage up |
-| **4-gram rescoring** | **0.465** | **0.629** | **0.710** | **0.627** | full/long-sentence top1 up |
+| **4-gram rescoring** | 0.465 | 0.629 | 0.710 | 0.627 | full/long-sentence top1 up |
+| **modified Kneser-Ney** | **0.468** | **0.633** | **0.711** | **0.628** | better smoothing; fair-gold +0.010 |
 
 The two dominant levers were the **curated lexicon** (correct readings) and the **smoothed
 trigram LM** — exactly as in commercial systems. On the controlled A/B over the 980 sentences
