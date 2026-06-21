@@ -25,8 +25,11 @@
 //! (the unigram term lives on the word edge, so backoff is just the surcharge). The 2-word case
 //! (sentence start / first transition) uses `transition_cost`.
 
-use crate::consts::{BIGRAM_BACKOFF as CONST_BIGRAM_BACKOFF, TRIGRAM_BACKOFF as CONST_TRIGRAM_BACKOFF};
-use crate::format::{bigram_key, trigram_key};
+use crate::consts::{
+    BIGRAM_BACKOFF as CONST_BIGRAM_BACKOFF, FOURGRAM_BACKOFF as CONST_FOURGRAM_BACKOFF,
+    TRIGRAM_BACKOFF as CONST_TRIGRAM_BACKOFF,
+};
+use crate::format::{bigram_key, fourgram_key, trigram_key};
 use fst::raw::Fst;
 use memmap2::Mmap;
 use std::fs::File;
@@ -36,6 +39,8 @@ use std::path::Path;
 pub const BIGRAM_BACKOFF: i32 = CONST_BIGRAM_BACKOFF;
 /// Signed backoff surcharge added when a trigram is absent. Re-export of `consts::TRIGRAM_BACKOFF`.
 pub const TRIGRAM_BACKOFF: i32 = CONST_TRIGRAM_BACKOFF;
+/// Signed backoff surcharge added when a 4-gram is absent. Re-export of `consts::FOURGRAM_BACKOFF`.
+pub const FOURGRAM_BACKOFF: i32 = CONST_FOURGRAM_BACKOFF;
 
 /// Bias added to a signed transition cost before storing it as the (unsigned) `u64` FST value, and
 /// subtracted on read. MUST exceed the most-negative representable cost in magnitude. Shared with
@@ -66,9 +71,18 @@ pub struct LanguageModel {
     /// Optional trigram model. Present only when `data/trigram.fst` exists (v2 data). When absent
     /// the model runs bigram-only, exactly reproducing the v1 behavior.
     trigram: Option<TrigramModel>,
+    /// Optional 4-gram model. Present only when `data/fourgram.fst` exists. Used ONLY by the N-best
+    /// rescoring pass (`transition_cost4`), never by the trigram beam. When absent the engine behaves
+    /// exactly as the trigram-only decoder (no rescoring, no regression).
+    fourgram: Option<FourgramModel>,
 }
 
 struct TrigramModel {
+    _mmap: Mmap,
+    fst: Fst<&'static [u8]>,
+}
+
+struct FourgramModel {
     _mmap: Mmap,
     fst: Fst<&'static [u8]>,
 }
@@ -88,8 +102,11 @@ impl LanguageModel {
         // Optional trigram model: load if present, else stay bigram-only. A missing file MUST NOT
         // be an error — the engine degrades gracefully to the v1 bigram decoder.
         let trigram = Self::load_trigram(data_dir)?;
+        // Optional 4-gram model: load if present, else the rescoring pass is inert. A missing file
+        // MUST NOT be an error — the engine degrades gracefully to the trigram-only decoder.
+        let fourgram = Self::load_fourgram(data_dir)?;
 
-        Ok(LanguageModel { _mmap: mmap, fst, trigram })
+        Ok(LanguageModel { _mmap: mmap, fst, trigram, fourgram })
     }
 
     /// Load `trigram.fst` if it exists. Returns `Ok(None)` when the file is absent (graceful
@@ -110,9 +127,34 @@ impl LanguageModel {
         Ok(Some(TrigramModel { _mmap: mmap, fst }))
     }
 
+    /// Load `fourgram.fst` if it exists. Returns `Ok(None)` when the file is absent (graceful
+    /// trigram-only fallback — the rescoring pass becomes a no-op); only a present-but-corrupt file
+    /// is an error. Mirrors `load_trigram`.
+    fn load_fourgram(data_dir: &Path) -> anyhow::Result<Option<FourgramModel>> {
+        let path = data_dir.join("fourgram.fst");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let f = File::open(&path)
+            .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+        // SAFETY: read-only mmap held for the lifetime of this struct.
+        let mmap = unsafe { Mmap::map(&f) }
+            .map_err(|e| anyhow::anyhow!("mmap {}: {e}", path.display()))?;
+        let slice: &'static [u8] =
+            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&mmap[..]) };
+        let fst = Fst::new(slice).map_err(|e| anyhow::anyhow!("invalid fourgram.fst: {e}"))?;
+        Ok(Some(FourgramModel { _mmap: mmap, fst }))
+    }
+
     /// True if a trigram model is loaded (v2 data). Useful for tests/diagnostics.
     pub fn has_trigram(&self) -> bool {
         self.trigram.is_some()
+    }
+
+    /// True if a 4-gram model is loaded (the N-best rescoring pass is active). Useful for
+    /// tests/diagnostics and to let the decoder skip the rescoring pass entirely when absent.
+    pub fn has_fourgram(&self) -> bool {
+        self.fourgram.is_some()
     }
 
     /// Signed bigram transition cost for `(prev_id, id)`, or `None` if absent (caller applies
@@ -174,6 +216,39 @@ impl LanguageModel {
         }
         TRIGRAM_BACKOFF + self.bigram_backoff_cost(w2, w3)
     }
+
+    /// Signed 4-gram transition cost for `(w0, w1, w2, w3)`, or `None` if absent / no 4-gram model.
+    /// The stored FST value uses the SAME signed-log-ratio encoding as bigram/trigram.
+    pub fn fourgram_cost(&self, w0: u32, w1: u32, w2: u32, w3: u32) -> Option<i32> {
+        let fg = self.fourgram.as_ref()?;
+        let key = fourgram_key(w0, w1, w2, w3);
+        fg.fst.get(key).map(|o| decode_cost(o.value()))
+    }
+
+    /// Signed log-ratio 4-gram transition cost `cost(w3 | w0, w1, w2)` with stupid-backoff:
+    ///   * full 4-gram `(w0,w1,w2,w3)` if present,
+    ///   * else `FOURGRAM_BACKOFF + transition_cost3(w1, w2, w3)` (which itself backs off 3→2→1).
+    ///
+    /// Used ONLY by the decoder's N-best rescoring pass. Any of `w0`/`w1`/`w2` may be the
+    /// `SENTENCE_START` sentinel; in that case there is no full 4-gram context, so it falls straight
+    /// through to `transition_cost3` (consistent with how the trigram beam handles sentence starts).
+    /// The `unigram_w3` term is paid on the word edge by the caller, mirroring `transition_cost3`.
+    pub fn transition_cost4(&self, w0: u32, w1: u32, w2: u32, w3: u32, unigram_w3: u32) -> i32 {
+        // No full 4-gram history (sentence start) or no 4-gram model loaded: fall through to the
+        // trigram transition with NO surcharge (FOURGRAM_BACKOFF has meaning only relative to a
+        // *present* 4-gram entry, so adding it on a sentinel/absent-model path would distort the
+        // trigram-equivalent cost and could regress).
+        if w0 == SENTENCE_START || w1 == SENTENCE_START || w2 == SENTENCE_START {
+            return self.transition_cost3(w1, w2, w3, unigram_w3);
+        }
+        if self.fourgram.is_none() {
+            return self.transition_cost3(w1, w2, w3, unigram_w3);
+        }
+        if let Some(c) = self.fourgram_cost(w0, w1, w2, w3) {
+            return c;
+        }
+        FOURGRAM_BACKOFF + self.transition_cost3(w1, w2, w3, unigram_w3)
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +260,15 @@ mod tests {
     /// fst maps to a temp dir and loads via `LanguageModel::load` (exercising the real loader,
     /// including the graceful trigram-absent path).
     fn lm(bigrams: &[(u32, u32, u64)], trigrams: Option<&[(u32, u32, u32, u64)]>) -> LanguageModel {
+        lm_full(bigrams, trigrams, None)
+    }
+
+    /// Like `lm`, but also optionally writes a `fourgram.fst` so `transition_cost4` can be tested.
+    fn lm_full(
+        bigrams: &[(u32, u32, u64)],
+        trigrams: Option<&[(u32, u32, u32, u64)]>,
+        fourgrams: Option<&[(u32, u32, u32, u32, u64)]>,
+    ) -> LanguageModel {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let uniq = CTR.fetch_add(1, Ordering::Relaxed);
@@ -209,6 +293,18 @@ mod tests {
                 tb.insert(trigram_key(*a, *b, *c), encode_cost(*cost as i32)).unwrap();
             }
             std::fs::write(dir.join("trigram.fst"), tb.into_inner().unwrap()).unwrap();
+        }
+
+        if let Some(fg) = fourgrams {
+            let mut fv: Vec<_> = fg.to_vec();
+            fv.sort_by(|a, b| {
+                fourgram_key(a.0, a.1, a.2, a.3).cmp(&fourgram_key(b.0, b.1, b.2, b.3))
+            });
+            let mut fb = fst::MapBuilder::memory();
+            for (a, b, c, d, cost) in &fv {
+                fb.insert(fourgram_key(*a, *b, *c, *d), encode_cost(*cost as i32)).unwrap();
+            }
+            std::fs::write(dir.join("fourgram.fst"), fb.into_inner().unwrap()).unwrap();
         }
         LanguageModel::load(&dir).unwrap()
     }
@@ -250,5 +346,46 @@ mod tests {
         assert!(c3 < c2, "the present (cheap) trigram must win");
         // Trigram miss AND bigram miss -> TRIGRAM_BACKOFF + BIGRAM_BACKOFF.
         assert_eq!(m.transition_cost3(0, 1, 9, 100), TRIGRAM_BACKOFF + BIGRAM_BACKOFF);
+    }
+
+    #[test]
+    fn fourgram_absent_reduces_to_trigram() {
+        // No fourgram.fst: transition_cost4 must equal transition_cost3 on the right 3 words, with
+        // NO surcharge, so the rescoring pass is a strict no-op without the file.
+        let m = lm_full(&[(1, 2, 70), (2, 3, 80)], Some(&[(1, 2, 3, 5)]), None);
+        assert!(!m.has_fourgram());
+        // Full history present, no 4-gram model -> exactly the trigram cost.
+        assert_eq!(
+            m.transition_cost4(0, 1, 2, 3, 100),
+            m.transition_cost3(1, 2, 3, 100)
+        );
+        assert_eq!(m.transition_cost4(0, 1, 2, 3, 100), 5);
+    }
+
+    #[test]
+    fn fourgram_present_and_backoff() {
+        // 4-gram (0,1,2,3) is cheap; (0,1,2,9) is absent so it backs off to FOURGRAM_BACKOFF +
+        // trigram(1,2,9) which itself backs off (no trigram (1,2,9)) to TRIGRAM_BACKOFF+bigram(2,9).
+        let m = lm_full(
+            &[(1, 2, 70), (2, 3, 80)],
+            Some(&[(1, 2, 3, 5)]),
+            Some(&[(0, 1, 2, 3, 2)]),
+        );
+        assert!(m.has_fourgram());
+        // Present 4-gram used verbatim.
+        assert_eq!(m.transition_cost4(0, 1, 2, 3, 100), 2);
+        // Missing 4-gram -> FOURGRAM_BACKOFF + trigram(1,2,3) (which is present = 5).
+        assert_eq!(m.transition_cost4(9, 1, 2, 3, 100), FOURGRAM_BACKOFF + 5);
+        // Missing 4-gram AND missing trigram -> FOURGRAM_BACKOFF + (TRIGRAM_BACKOFF + bigram(2,9)).
+        // bigram(2,9) is absent -> BIGRAM_BACKOFF.
+        assert_eq!(
+            m.transition_cost4(0, 1, 2, 9, 100),
+            FOURGRAM_BACKOFF + TRIGRAM_BACKOFF + BIGRAM_BACKOFF
+        );
+        // Sentence-start sentinel anywhere in the history -> falls through to trigram, no surcharge.
+        assert_eq!(
+            m.transition_cost4(SENTENCE_START, 1, 2, 3, 100),
+            m.transition_cost3(1, 2, 3, 100)
+        );
     }
 }

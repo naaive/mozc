@@ -96,6 +96,18 @@ struct Partial {
     last_word_id: Option<u32>,
     first_word_id: Option<u32>,
     kind: CandidateKind,
+    /// Word-id sequence of this path, in surface order, used by the 4-gram rescoring pass. Each
+    /// entry is the dictionary word id of a Chinese edge, or `lm::SENTENCE_START` (== u32::MAX) for
+    /// an English edge / literal passthrough / chunk boundary that carries no LM identity (a history
+    /// reset). The rescoring walk treats a `SENTENCE_START` entry as a context break, exactly as the
+    /// trigram beam does. Empty when the 4-gram model is absent (the chain is then never built).
+    word_chain: Vec<u32>,
+    /// Sum of the *trigram* transition costs the beam (and `combine`) added along this path. The
+    /// rescoring pass replaces this with the 4-gram transition sum: `new_score = score -
+    /// trigram_trans_sum + fourgram_trans_sum`, so every NON-LM cost (reading/edit/fuzzy/abbrev/
+    /// english penalties, bonuses, literal demotion) is preserved byte-for-byte. Only meaningful
+    /// when `word_chain` is populated (4-gram model present).
+    trigram_trans_sum: i32,
 }
 
 pub fn decode(engine: &Engine, input: &str, cfg: &EngineConfig) -> Vec<Candidate> {
@@ -147,6 +159,15 @@ fn decode_inner(engine: &Engine, input: &str, cfg: &EngineConfig, predict: bool)
     // inputs, which do not segment as exact pinyin but still have a full Chinese reading.
     if !predict {
         demote_full_input_literal(input, &mut combined);
+    }
+
+    // 3c. 4-gram N-best RESCORING (convert only). When `fourgram.fst` is loaded, recompute the LM
+    // portion of each retained candidate's TOTAL cost with the 4-gram model (4→3→2→1 stupid-backoff)
+    // and re-sort. Inert (no-op) when the 4-gram model is absent, so there is no regression without
+    // the file. This only REORDERS the existing N-best — non-LM costs are untouched — so latency
+    // stays flat (a few hundred fst lookups).
+    if !predict && engine.lm.has_fourgram() {
+        rescore_fourgram(engine, &mut combined);
     }
 
     // 4. to Candidate, sorted, truncated.
@@ -222,6 +243,52 @@ fn demote_full_input_literal(input: &str, combined: &mut [Partial]) {
     }
 }
 
+/// 4-gram N-best rescoring pass. For each retained whole-input candidate, replace the trigram LM
+/// transition sum the beam accumulated (`trigram_trans_sum`) with the 4-gram transition sum computed
+/// by walking the candidate's `word_chain` with `transition_cost4` (4→3→2→1 stupid-backoff). All
+/// NON-LM costs (reading/edit/fuzzy/abbrev/english penalties, abbrev word-length boosts, the literal
+/// demotion) are preserved EXACTLY: we mutate only the score, by `-trigram_trans_sum + fourgram_sum`.
+///
+/// The `word_chain` carries `lm::SENTENCE_START` (== u32::MAX) for English edges / literal
+/// passthroughs / chunk boundaries that reset the language-model history; the walk treats a sentinel
+/// as a context break (and never charges a transition INTO it), mirroring the trigram beam, so the
+/// 4-gram cost is computed on the same contexts the trigram cost was.
+fn rescore_fourgram(engine: &Engine, combined: &mut [Partial]) {
+    use crate::lm::SENTENCE_START;
+    for p in combined.iter_mut() {
+        // Candidates whose chain has < 2 real words cannot have any 4-gram context that differs from
+        // the trigram (transition_cost4 falls straight through to transition_cost3 on short history),
+        // so rescoring them is a strict no-op — skip the work.
+        if p.word_chain.len() < 2 {
+            continue;
+        }
+        let mut fourgram_sum: i32 = 0;
+        // History window: the previous three (real-or-sentinel) words in surface order.
+        let mut w0 = SENTENCE_START;
+        let mut w1 = SENTENCE_START;
+        let mut w2 = SENTENCE_START;
+        for &w3 in &p.word_chain {
+            if w3 == SENTENCE_START {
+                // History reset (English / literal / boundary): no transition charged into it.
+                w0 = SENTENCE_START;
+                w1 = SENTENCE_START;
+                w2 = SENTENCE_START;
+                continue;
+            }
+            let unigram_w3 = engine.lexicon.unigram_cost(w3).unwrap_or(0) as u32;
+            fourgram_sum += engine.lm.transition_cost4(w0, w1, w2, w3, unigram_w3);
+            // Slide the window forward.
+            w0 = w1;
+            w1 = w2;
+            w2 = w3;
+        }
+        // Swap the LM portion: total = old_total - trigram_sum + fourgram_sum.
+        p.score = p.score - p.trigram_trans_sum + fourgram_sum;
+        // Keep the bookkeeping consistent if anything reads it again (idempotent re-rescoring).
+        p.trigram_trans_sum = fourgram_sum;
+    }
+}
+
 enum Chunk {
     Latin { text: String, byte_start: usize },
     Literal { text: String, byte_start: usize },
@@ -276,6 +343,8 @@ fn literal_partial(text: &str, byte_start: usize) -> Partial {
             last_word_id: None,
             first_word_id: None,
             kind: CandidateKind::Chinese,
+            word_chain: Vec::new(),
+            trigram_trans_sum: 0,
         };
     }
     Partial {
@@ -289,6 +358,10 @@ fn literal_partial(text: &str, byte_start: usize) -> Partial {
         last_word_id: None,
         first_word_id: None,
         kind: CandidateKind::Chinese,
+        // Literal passthrough carries no LM identity: a single history-reset sentinel so a 4-gram
+        // walk treats it as a context break (matches the bigram beam, where literals reset history).
+        word_chain: vec![crate::lm::SENTENCE_START],
+        trigram_trans_sum: 0,
     }
 }
 
@@ -495,6 +568,9 @@ fn decode_latin(
             last_word_id: None,
             first_word_id: None,
             kind: CandidateKind::English,
+            // Whole-run English literal: a single history-reset sentinel (no LM identity).
+            word_chain: vec![crate::lm::SENTENCE_START],
+            trigram_trans_sum: 0,
         });
     }
 
@@ -807,6 +883,9 @@ fn beam_search(
     }
 
     // Reconstruct candidate Partials from terminal nodes (full coverage, or any prefix in predict).
+    // The word-id chain + trigram transition sum are only needed by the 4-gram rescoring pass, so we
+    // build them solely when a 4-gram model is loaded (zero overhead on the trigram-only path).
+    let want_chain = engine.lm.has_fourgram();
     let mut out: Vec<Partial> = Vec::new();
     let reconstruct = |mut idx: usize, extra: i32| -> Option<Partial> {
         let mut node = arena[idx];
@@ -857,6 +936,39 @@ fn beam_search(
             (false, true) => CandidateKind::English,
             _ => CandidateKind::Chinese,
         };
+        // Build the word-id chain + recompute the trigram transition sum the beam added along this
+        // path, for the 4-gram rescoring pass. Recomputing from the chain reproduces the beam's
+        // transition cost EXACTLY (same `transition_cost3` with the same SENTENCE_START sentinels at
+        // the origin and after English edges), so subtracting it and re-adding the 4-gram sum changes
+        // ONLY the LM portion of the score — all non-LM costs are preserved.
+        let (word_chain, trigram_trans_sum) = if want_chain {
+            let mut wc: Vec<u32> = Vec::with_capacity(chain.len());
+            let mut tg_sum: i32 = 0;
+            for &ei in &chain {
+                let we = &flat[ei as usize];
+                let w3 = if we.word_id == ENGLISH_EDGE {
+                    // English edge: no LM identity → history reset (sentinel), no transition.
+                    crate::lm::SENTENCE_START
+                } else {
+                    we.word_id
+                };
+                if w3 != crate::lm::SENTENCE_START {
+                    // History from the chain we've built so far (last two real-or-sentinel words).
+                    let w_prev = wc.last().copied().unwrap_or(crate::lm::SENTENCE_START);
+                    let w_prevprev = if wc.len() >= 2 {
+                        wc[wc.len() - 2]
+                    } else {
+                        crate::lm::SENTENCE_START
+                    };
+                    let unigram_w3 = engine.lexicon.unigram_cost(we.word_id).unwrap_or(0) as u32;
+                    tg_sum += engine.lm.transition_cost3(w_prevprev, w_prev, w3, unigram_w3);
+                }
+                wc.push(w3);
+            }
+            (wc, tg_sum)
+        } else {
+            (Vec::new(), 0)
+        };
         Some(Partial {
             text,
             score: final_score,
@@ -864,6 +976,8 @@ fn beam_search(
             last_word_id,
             first_word_id,
             kind,
+            word_chain,
+            trigram_trans_sum,
         })
     };
 
@@ -881,7 +995,15 @@ fn beam_search(
         // bounding this is a key latency lever). The cap is generous enough to keep N-best diverse.
         let mut terminals = frontier[n].clone();
         terminals.sort_unstable_by_key(|&i| arena[i].score);
-        let recon_cap = (cfg.max_candidates * 3).max(width);
+        // Reconstruct a generous N-best. When a 4-gram model is loaded we widen this modestly so the
+        // rescoring pass sees more diverse word-id paths (the gold path is sometimes ranked below the
+        // trigram top-K but wins after the 4-gram upgrade). Reconstruction allocates strings, so this
+        // is bounded — the extra cap is small and only taken on the (already cheaper) 4-gram path.
+        let recon_cap = if engine.lm.has_fourgram() {
+            (cfg.max_candidates * 5).max(width)
+        } else {
+            (cfg.max_candidates * 3).max(width)
+        };
         terminals.truncate(recon_cap);
         for &idx in &terminals {
             if let Some(p) = reconstruct(idx, 0) {
@@ -967,7 +1089,14 @@ fn dedup_best(list: &mut Vec<Partial>) {
 
 /// Combine chunk N-best lists sequentially. Bounded best-first product.
 fn combine(engine: &Engine, lists: Vec<Vec<Partial>>, cfg: &EngineConfig) -> Vec<Partial> {
-    let cap = (cfg.max_candidates * 3).max(cfg.beam_width);
+    let want_chain = engine.lm.has_fourgram();
+    // Widen the retained product modestly when 4-gram rescoring is active so the gold path is more
+    // likely to be in the N-best that gets re-ranked. Bounded so latency stays flat.
+    let cap = if want_chain {
+        (cfg.max_candidates * 5).max(cfg.beam_width)
+    } else {
+        (cfg.max_candidates * 3).max(cfg.beam_width)
+    };
     let mut acc: Vec<Partial> = vec![Partial {
         text: String::new(),
         score: 0,
@@ -975,6 +1104,8 @@ fn combine(engine: &Engine, lists: Vec<Vec<Partial>>, cfg: &EngineConfig) -> Vec
         last_word_id: None,
         first_word_id: None,
         kind: CandidateKind::Chinese,
+        word_chain: Vec::new(),
+        trigram_trans_sum: 0,
     }];
 
     for list in lists {
@@ -992,6 +1123,16 @@ fn combine(engine: &Engine, lists: Vec<Vec<Partial>>, cfg: &EngineConfig) -> Vec
                 let kind = merge_kind(a.kind, b.kind, a.segments.is_empty(), b.segments.is_empty());
                 let mut segs = a.segments.clone();
                 segs.extend(b.segments.iter().cloned());
+                // Concatenate the per-chunk word chains for the 4-gram rescoring pass, and fold the
+                // cross-chunk LM transition the beam just added into the (subtracted-then-replaced)
+                // trigram transition sum so the rescoring re-add stays exact.
+                let (word_chain, trigram_trans_sum) = if want_chain {
+                    let mut wc = a.word_chain.clone();
+                    wc.extend_from_slice(&b.word_chain);
+                    (wc, a.trigram_trans_sum + b.trigram_trans_sum + trans)
+                } else {
+                    (Vec::new(), 0)
+                };
                 next.push(Partial {
                     text: format!("{}{}", a.text, b.text),
                     score: a.score + b.score + trans,
@@ -999,6 +1140,8 @@ fn combine(engine: &Engine, lists: Vec<Vec<Partial>>, cfg: &EngineConfig) -> Vec
                     last_word_id: b.last_word_id.or(a.last_word_id),
                     first_word_id: a.first_word_id.or(b.first_word_id),
                     kind,
+                    word_chain,
+                    trigram_trans_sum,
                 });
             }
         }
