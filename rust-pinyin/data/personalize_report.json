@@ -1,0 +1,66 @@
+{
+  "seed": 42,
+  "stream_len": 380,
+  "recurring_phrases": 40,
+  "recurring_events": 190,
+  "auto_learned_cases": 14,
+  "overall_off": {
+    "n": 380,
+    "top1": 0.47368421052631576,
+    "mrr": 0.535292331937069
+  },
+  "overall_on": {
+    "n": 380,
+    "top1": 0.65,
+    "mrr": 0.6921071253308095
+  },
+  "recurring_off": {
+    "n": 190,
+    "top1": 0.531578947368421,
+    "mrr": 0.5806265664160399
+  },
+  "recurring_on": {
+    "n": 190,
+    "top1": 0.8736842105263158,
+    "mrr": 0.887121650279545
+  },
+  "learning_curve": [
+    {
+      "occurrence": 1,
+      "n": 46,
+      "top1_off": 0.4782608695652174,
+      "top1_on": 0.4782608695652174
+    },
+    {
+      "occurrence": 2,
+      "n": 46,
+      "top1_off": 0.4782608695652174,
+      "top1_on": 1.0
+    },
+    {
+      "occurrence": 3,
+      "n": 42,
+      "top1_off": 0.5238095238095238,
+      "top1_on": 1.0
+    },
+    {
+      "occurrence": 4,
+      "n": 27,
+      "top1_off": 0.6296296296296297,
+      "top1_on": 1.0
+    },
+    {
+      "occurrence": 5,
+      "n": 19,
+      "top1_off": 0.5789473684210527,
+      "top1_on": 1.0
+    },
+    {
+      "occurrence": 6,
+      "n": 10,
+      "top1_off": 0.7,
+      "top1_on": 1.0
+    }
+  ],
+  "auto_learned_recall": 1.0
+}

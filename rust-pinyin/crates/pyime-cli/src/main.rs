@@ -179,6 +179,11 @@ struct EvalArgs {
     /// RNG seed for gold generation / sampling (reproducibility).
     #[arg(long, default_value_t = 42)]
     seed: u64,
+    /// Run the PERSONALIZATION benchmark instead: simulate a user session and report the
+    /// online-adaptation lift (user model OFF vs ON) + learning curve. Writes
+    /// `personalize_report.json` next to --json if given.
+    #[arg(long)]
+    personalize: bool,
 }
 
 #[derive(Args)]
@@ -632,6 +637,27 @@ fn handle_command(
 // ===========================================================================
 
 fn cmd_eval(data_dir: &Path, args: &EvalArgs) -> Result<()> {
+    // Personalization benchmark: user model OFF vs ON over a simulated user session.
+    if args.personalize {
+        match pyime_eval::run_personalization(data_dir, args.seed)
+            .context("running personalization benchmark")?
+        {
+            Some(report) => {
+                print!("{}", pyime_eval::render_personalization(&report));
+                if let Some(json_path) = &args.json {
+                    let json = serde_json::to_string_pretty(&report)?;
+                    std::fs::write(json_path, json)
+                        .with_context(|| format!("writing {}", json_path.display()))?;
+                    eprintln!("wrote personalization report: {}", json_path.display());
+                }
+            }
+            None => eprintln!(
+                "personalization benchmark skipped: need data/ + a gold set or held-out corpus."
+            ),
+        }
+        return Ok(());
+    }
+
     let engine = load_engine(data_dir)?;
     let cfg = EngineConfig::default();
 

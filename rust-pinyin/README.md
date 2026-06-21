@@ -162,6 +162,36 @@ The two dominant levers were the **curated lexicon** (correct readings) and the 
 trigram LM** — exactly as in commercial systems. On the controlled A/B over the 980 sentences
 whose readings the per-char gold mis-spells, correct readings raise top-1 by **+0.40**.
 
+## User dictionary + online adaptation
+
+Like every commercial IME, the engine **learns from what the user commits**. An optional, persistent
+`UserModel` (per-word frequency + recency, user bigrams, and **auto-learned pinyin→surface phrases**,
+including out-of-vocabulary new words/names) blends a capped bonus into ranking. It is `Sync`
+(`RwLock`) so it coexists with the parallel eval, and adds **zero overhead / byte-identical output**
+when absent or `user_weight=0`.
+
+```bash
+# select-to-learn REPL: type pinyin, type a number to commit that candidate, it persists
+pyime --user ~/.pyime/user.json interactive
+# scripted / batch learning
+pyime --user u.json commit beijing 背景
+```
+
+A **personalization benchmark** (`pyime eval --personalize`) simulates a user session and measures
+the online-adaptation lift (convert-then-`commit`, no peeking):
+
+```
+subset                      n top1_off  top1_on    Δtop1
+overall                   380    0.474    0.650   +0.176
+recurring (headline)      190    0.532    0.874   +0.342
+
+Learning curve — recurring top-1 by occurrence:  #1 0.478 → #2..#6 = 1.000
+Auto-learned new-word recall (top-1 after first commit): 1.000
+```
+
+I.e. a phrase the user repeats is **at #1 from its 2nd use onward**, and a brand-new word/name is
+learned at #1 after a single commit — while the OFF baseline stays memoryless.
+
 ## Performance
 
 - Clean full-pinyin (6–12 chars): typical **2–3 ms**, p95 < 8 ms.
@@ -177,9 +207,10 @@ whose readings the per-char gold mis-spells, correct readings raise top-1 by **+
   `short_word`/`full` buckets better reflect interactive use.
 - A few polyphone-reading splits in the corpus cap exact matches (e.g. 受不了 reads
   `shou'bu'liao`, so `shoubule…` finds 手不了).
-- Natural next steps toward full commercial parity: a **4-gram / neural-rescoring** LM, a
-  **user dictionary + adaptation** layer (learns from the user's history), and **zero-query**
-  prediction. The 100 MB budget leaves ~50 MB of headroom for a larger model.
+- A **4-gram LM** (rescoring) and a **user dictionary + online adaptation** layer are implemented
+  (see above). Natural next steps toward full commercial parity: a much **larger LM corpus**
+  (the current ~19k surviving 4-grams are corpus-limited, not budget-limited), **neural rescoring**
+  (best trained off-box on a GPU — see the engine notes), and **zero-query** prediction.
 
 ## License
 

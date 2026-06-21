@@ -17,6 +17,11 @@ use std::time::Instant;
 use pyime_core::{Engine, EngineConfig};
 
 pub mod gold;
+pub mod personalize;
+
+pub use personalize::{
+    render_personalization, run_personalization, LearningPoint, PersonalizationReport, Score,
+};
 
 /// A single gold evaluation case. Serialized one-per-line as JSONL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
