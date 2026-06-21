@@ -550,21 +550,42 @@ fn beam_search(
         if frontier[pos].is_empty() {
             continue;
         }
-        // Beam-prune the frontier at this position (cheapest first).
+        // Beam-prune the frontier at this position (cheapest first). The trigram DP keys state on
+        // the previous TWO words, so the per-history keep dedups on (w_prev, w_prevprev).
         beam_prune(&mut frontier[pos], &arena, width);
         let frontier_pos = frontier[pos].clone();
 
         let (off, len) = edge_start[pos];
         for ei in off..off + len {
             let we = &flat[ei];
+            // Unigram cost of the target word (needed by the stupid-backoff transition). English
+            // edges have no LM identity, so it is never consulted for them.
+            let unigram_w3 = if we.word_id == ENGLISH_EDGE {
+                0
+            } else {
+                engine.lexicon.unigram_cost(we.word_id).unwrap_or(0) as u32
+            };
             for &prev_idx in &frontier_pos {
                 let prev = arena[prev_idx];
-                let prev_word = if prev.word_id == u32::MAX { None } else { Some(prev.word_id) };
+                // Trigram history: w_prev = the previous edge's word, w_prevprev = the word on the
+                // node BEFORE that (read straight from the arena). Both default to the
+                // `SENTENCE_START` (== u32::MAX) sentinel, which `transition_cost3` interprets as
+                // "no context": the origin node and English edges both carry u32::MAX, so they
+                // correctly reset the language-model history.
+                let w_prev = prev.word_id; // u32::MAX at origin / after an English edge
+                let w_prevprev = if prev.prev == usize::MAX {
+                    crate::lm::SENTENCE_START
+                } else {
+                    arena[prev.prev].word_id
+                };
                 // English edges carry no language-model identity: no transition into them.
                 let trans = if we.word_id == ENGLISH_EDGE {
                     0
                 } else {
-                    engine.lm.transition_cost(prev_word, we.word_id) as i32
+                    engine
+                        .lm
+                        .transition_cost3(w_prevprev, w_prev, we.word_id, unigram_w3)
+                        as i32
                 };
                 let new_score = prev.score + we.cost + trans;
                 let node_idx = arena.len();
@@ -666,22 +687,37 @@ fn beam_search(
 }
 
 /// Beam-prune a frontier of arena node indices to `width`, keeping the cheapest. Also dedups by
-/// `last_word_id` keeping the best per language-model history (so the beam carries diverse states
-/// rather than `width` copies of the same word).
+/// the trigram DP state `(w_prev, w_prevprev)` keeping the best few per language-model history (so
+/// the beam carries diverse states rather than `width` copies of the same 2-word context).
+///
+/// Keying on the FULL trigram state (both history words) is what makes the trigram beam correct:
+/// two nodes ending at the same position with the same last word but DIFFERENT prior words are now
+/// distinct DP states (they expand to different trigram costs), so they must not collapse together.
+/// The state space is larger than the bigram decoder's, so the per-state keep is kept tight and the
+/// overall width cap (applied below) bounds latency.
 fn beam_prune(frontier: &mut Vec<usize>, arena: &[VNode], width: usize) {
-    /// Keep up to this many distinct DP nodes per last_word_id (rather than collapsing to one),
-    /// so alternate language-model histories ending on the same word survive into reconstruction.
-    /// This is the main recall lever for N-best diversity without inflating the raw beam width.
-    const PER_WORD_KEEP: usize = 5;
+    /// Keep up to this many distinct DP nodes per (w_prev, w_prevprev) state (rather than
+    /// collapsing to one), so alternate language-model histories sharing the same 2-word context
+    /// survive into reconstruction. This is the main recall lever for N-best diversity without
+    /// inflating the raw beam width. Kept at 3 (vs the bigram decoder's 5) because the trigram
+    /// state key is finer-grained — distinct prior words already create distinct buckets — so a
+    /// smaller per-state keep preserves the same N-best diversity while holding the beam (and thus
+    /// latency) bounded against the larger trigram state space.
+    const PER_STATE_KEEP: usize = 3;
+    // The w_prevprev of a node is the last word of its parent (origin / English edge → sentinel).
+    let prevprev = |idx: usize| -> u32 {
+        let p = arena[idx].prev;
+        if p == usize::MAX { crate::lm::SENTENCE_START } else { arena[p].word_id }
+    };
     if frontier.len() > 1 {
-        // keep the cheapest few per last_word_id
+        // keep the cheapest few per (w_prev, w_prevprev) trigram state
         frontier.sort_unstable_by_key(|&i| arena[i].score);
-        let mut per_word: FxHashMap<u32, usize> = FxHashMap::default();
+        let mut per_state: FxHashMap<(u32, u32), usize> = FxHashMap::default();
         let mut kept: Vec<usize> = Vec::with_capacity(frontier.len().min(width));
         for &idx in frontier.iter() {
-            let wid = arena[idx].word_id;
-            let c = per_word.entry(wid).or_insert(0);
-            if *c >= PER_WORD_KEEP {
+            let key = (arena[idx].word_id, prevprev(idx));
+            let c = per_state.entry(key).or_insert(0);
+            if *c >= PER_STATE_KEEP {
                 continue;
             }
             *c += 1;

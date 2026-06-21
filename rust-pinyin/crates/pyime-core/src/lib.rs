@@ -23,6 +23,18 @@ pub mod consts {
     pub const ABBR_PEN: i32 = 1800;
     /// Penalty applied per English edge so clean pinyin segmentation wins.
     pub const ENGLISH_PEN: i32 = 3000;
+
+    /// Backoff penalty (in LOG_BASE cost units) added when a *bigram* is absent and the model
+    /// falls through to the unigram cost. Used by both the 2-word (`transition_cost`) and the
+    /// 3-word stupid-backoff (`transition_cost3`) transitions. (Relocated here from `lm.rs`; the
+    /// `lm::BIGRAM_BACKOFF` alias is kept for backwards compatibility.)
+    pub const BIGRAM_BACKOFF: u32 = 2400;
+    /// Backoff penalty added when a *trigram* `(w1,w2,w3)` is absent and the stupid-backoff model
+    /// falls through to the bigram (or unigram) estimate. Stupid-backoff multiplies P by a fixed
+    /// factor per backoff level; in additive log-cost space that is a constant surcharge. Tuned in
+    /// the 2000–3000 band so a present trigram is preferred but a missing one still ranks on its
+    /// bigram/unigram evidence.
+    pub const TRIGRAM_BACKOFF: u32 = 2600;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
