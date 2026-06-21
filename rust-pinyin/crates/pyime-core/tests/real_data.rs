@@ -103,6 +103,101 @@ fn english_words_survive_and_win() {
     }
 }
 
+/// 简拼 (abbreviation) ranking: a single dictionary word matching the whole abbreviation by its
+/// initials (possibly mixed with a full final syllable) must rank at #1, beating both the opaque
+/// latin literal and high-frequency single characters. `kyi` = k(e) + yi, `keyi` = full, both → 可以.
+#[test]
+fn abbrev_single_word_top1() {
+    let Some(e) = engine() else {
+        eprintln!("skip abbrev_single_word_top1: no data/");
+        return;
+    };
+    let cfg = EngineConfig::default();
+    for (input, want) in [("kyi", "可以"), ("keyi", "可以"), ("bj", "北京"), ("ky", "可以")] {
+        let top = top_texts(&e, input, &cfg, 5);
+        assert_eq!(
+            top.first().map(String::as_str),
+            Some(want),
+            "{input} should rank {want} #1, got {top:?}"
+        );
+    }
+}
+
+/// For abbreviation-shaped input the opaque whole-input latin literal must NOT be #1 (it is demoted
+/// beneath the Chinese expansions), while still remaining present somewhere in the list.
+#[test]
+fn abbrev_literal_demoted() {
+    let Some(e) = engine() else {
+        eprintln!("skip abbrev_literal_demoted: no data/");
+        return;
+    };
+    let cfg = EngineConfig::default();
+    for input in ["nh", "ky", "wm", "kyi"] {
+        let cands = e.convert(input, &cfg);
+        let top = cands.iter().take(6).map(|c| c.text.clone()).collect::<Vec<_>>();
+        assert_ne!(
+            cands.first().map(|c| c.text.as_str()),
+            Some(input),
+            "{input}: literal must not be #1 for abbreviation-shaped input, got {top:?}"
+        );
+    }
+}
+
+/// `nh` should surface a common greeting (你好 / 您好) within the top few candidates — the
+/// abbreviation must reach and rank multi-character words, not bury them.
+#[test]
+fn abbrev_nh_greeting_near_top() {
+    let Some(e) = engine() else {
+        eprintln!("skip abbrev_nh_greeting_near_top: no data/");
+        return;
+    };
+    let cfg = EngineConfig::default();
+    let top = top_texts(&e, "nh", &cfg, 10);
+    assert!(
+        top.iter().any(|t| t == "你好" || t == "您好"),
+        "nh should include 你好/您好 in the top 10, got {top:?}"
+    );
+}
+
+/// Coverage: deep 3-initial multi-syllable 简拼 words must be REACHABLE (present in the candidate
+/// list), even if not #1 — `sbl` → 受不了 (shou'bu'liao), `zgr` → 中国人 (zhong'guo'ren). A bare `s`/`z`
+/// initial must also match the retroflex sh/zh series for this to work.
+#[test]
+fn abbrev_deep_words_reachable() {
+    let Some(e) = engine() else {
+        eprintln!("skip abbrev_deep_words_reachable: no data/");
+        return;
+    };
+    let cfg = EngineConfig::default();
+    for (input, want) in [("sbl", "受不了"), ("zgr", "中国人")] {
+        let texts = top_texts(&e, input, &cfg, cfg.max_candidates);
+        assert!(
+            texts.iter().any(|t| t == want),
+            "{input} should have {want} reachable in the candidate list, got {texts:?}"
+        );
+    }
+}
+
+/// Guard: normal short full-pinyin words keep their single-character answers — the abbreviation
+/// single-char demotion must be gated strictly on abbreviation shape and never fire for clean
+/// full pinyin like `wo`→我 / `de`→的 / `nihao`→你好.
+#[test]
+fn abbrev_does_not_touch_clean_pinyin() {
+    let Some(e) = engine() else {
+        eprintln!("skip abbrev_does_not_touch_clean_pinyin: no data/");
+        return;
+    };
+    let cfg = EngineConfig::default();
+    for (input, want) in [("wo", "我"), ("de", "的"), ("nihao", "你好")] {
+        let top = top_texts(&e, input, &cfg, 3);
+        assert_eq!(
+            top.first().map(String::as_str),
+            Some(want),
+            "{input} should stay {want} #1, got {top:?}"
+        );
+    }
+}
+
 /// Typo'd full-sentence pinyin (edit-distance ≤1–2) whose corrected Chinese reading COVERS the
 /// whole input must out-rank the opaque whole-input literal passthrough at #1. These do not segment
 /// as exact pinyin (so the clean `fully_segments` demotion does not apply), but the full Chinese

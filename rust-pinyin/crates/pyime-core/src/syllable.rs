@@ -116,6 +116,62 @@ pub fn is_initial(s: &str) -> bool {
 /// Maximum canonical syllable length (in bytes/ascii chars).
 pub const MAX_SYL_LEN: usize = 6; // e.g. "zhuang", "shuang"
 
+/// Map from an abbreviation initial token (e.g. "k", "zh", "y") to the canonical syllables that
+/// begin with that initial. Built once. This lets the lexicon expand an abbreviation token into a
+/// *bounded, exact* set of syllable completions (instead of an unbounded raw-FST DFS), which both
+/// caps work and guarantees every legal syllable (e.g. `ke`, `shou`) is reachable — critical for
+/// 简拼 coverage of multi-syllable words like 可以(ke'yi) / 受不了(shou'bu'liao).
+fn syllables_by_initial() -> &'static std::collections::HashMap<&'static str, Vec<&'static str>> {
+    static MAP: OnceLock<std::collections::HashMap<&'static str, Vec<&'static str>>> =
+        OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m: std::collections::HashMap<&'static str, Vec<&'static str>> =
+            std::collections::HashMap::new();
+        for &syl in SYLLABLES {
+            // The initial is the 2-char prefix for zh/ch/sh, else the longest matching 1-char
+            // initial. Vowel-initial syllables (a/e/o/ai/...) have no consonant initial and are
+            // not reachable via an abbreviation token, so they are skipped here.
+            let two = if syl.len() >= 2 { Some(&syl[..2]) } else { None };
+            let init = if two.map(is_initial).unwrap_or(false) {
+                &syl[..2]
+            } else if is_initial(&syl[..1]) {
+                &syl[..1]
+            } else {
+                continue;
+            };
+            m.entry(init).or_default().push(syl);
+        }
+        m
+    })
+}
+
+/// Canonical syllables that begin with the abbreviation initial `init` (e.g. "k" → ka, kai, ke, …).
+/// Returns an empty slice for an unknown initial.
+///
+/// A bare `z`/`c`/`s` abbreviation initial ALSO matches the retroflex `zh`/`ch`/`sh` syllables
+/// (e.g. `s` → both `si` and `shou`): commercial 简拼 treats a typed `s` as the initial of either
+/// series (the user rarely types the `h`). Without this, `sbl` → 受不了(shou'bu'liao) and
+/// `zgr` → 中国人(zhong'guo'ren) would be unreachable. The combined list is precomputed and cached.
+pub fn syllables_for_initial(init: &str) -> &'static [&'static str] {
+    fn combined() -> &'static std::collections::HashMap<&'static str, Vec<&'static str>> {
+        static MAP: OnceLock<std::collections::HashMap<&'static str, Vec<&'static str>>> =
+            OnceLock::new();
+        MAP.get_or_init(|| {
+            let base = syllables_by_initial();
+            let mut m: std::collections::HashMap<&'static str, Vec<&'static str>> = base.clone();
+            for (bare, retro) in [("z", "zh"), ("c", "ch"), ("s", "sh")] {
+                let extra: Vec<&'static str> = base.get(retro).cloned().unwrap_or_default();
+                m.entry(bare).or_default().extend(extra);
+            }
+            m
+        })
+    }
+    combined()
+        .get(init)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+}
+
 /// Enumerate every way to split a *prefix* of `s` (starting at byte 0) into a single valid
 /// syllable. Returns `(syllable_str_slice, consumed_len)` for each, longest-first (max munch
 /// ordering preserved by descending length).
@@ -192,3 +248,5 @@ mod tests {
         assert_eq!(p[0], ("zh", 2));
     }
 }
+
+

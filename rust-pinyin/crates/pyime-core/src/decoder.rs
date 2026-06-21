@@ -52,6 +52,23 @@ const ABBREV_MAX_LEN: usize = 8;
 const ABBREV_LITERAL_PEN: i32 = 6000;
 const ABBREV_LITERAL_PER_CHAR: i32 = 3500;
 
+/// Flat per-Chinese-word penalty added to every dictionary word edge when decoding abbreviation-
+/// shaped input. It makes a path's cost grow with its WORD COUNT, so covering the abbreviation with
+/// fewer, longer words (北京 vs 不+部, 我们 vs 我+们, 受不了 vs 受+不+了) wins. Tuned so a real
+/// multi-syllable word beats the equivalent single-char chain without inverting genuine phrase
+/// boundaries (a true 2-word abbreviation still decodes as 2 words). Abbrev input only.
+const ABBREV_WORD_PER_EDGE: i32 = 1200;
+/// Extra penalty on a *single-hanzi* word edge that covers a single initial, applied only for
+/// abbreviation-shaped input. The user typing `bj` almost never wants the bare character 不; this
+/// demotes such 1-char-per-initial readings beneath any genuine multi-character word covering the
+/// same initials, while leaving normal full-pinyin single-char answers (我/的) untouched (they are
+/// not abbrev-shaped, so this never fires for them).
+const ABBREV_SINGLE_CHAR_PEN: i32 = 1200;
+/// Per-extra-initial reward for a multi-character dictionary word matched by its initials, so a word
+/// covering MORE of the abbreviation (受不了 = 3 initials) outranks a shorter word covering only a
+/// prefix (首播 = 2 initials). Applied on top of the per-initial ABBR_PEN refund. Abbrev input only.
+const ABBREV_MULTISYL_BONUS: i32 = 1500;
+
 /// Minimum length of an in-lattice English sub-span edge. Short 1-2 letter "words" in english.fst
 /// (a, i, of, ...) would over-fire and interfere with pinyin segmentation, so we require ≥3.
 const ENGLISH_MIN_LEN: usize = 4;
@@ -354,6 +371,54 @@ fn is_abbrev_shaped(letters: &str) -> bool {
     tokens >= 2
 }
 
+/// Generalized abbreviation-shape detector covering the *initial + full-syllable mix* that pure
+/// `is_abbrev_shaped` misses: `kyi` = k(initial) + yi(syllable), `bjing` = b + jing, `nihao` is NOT
+/// abbrev (it tiles entirely as full syllables with zero bare initials). Returns `Some(n_initials)`
+/// — the number of bare-initial tokens in the chosen tiling — when the run is short and tiles by a
+/// mix of {bare initials, full syllables} with at least one bare initial; else `None`.
+///
+/// The caller MUST additionally gate on `!fully_segments` (clean full pinyin like `wo`, `de`,
+/// `nihao`, `xian` reads as syllables and must keep its normal single-/multi-char answers). This
+/// detector only decides the *shape*; it is the conjunction (`abbrev-shaped AND not clean pinyin`)
+/// that flags genuine 简拼 input.
+///
+/// Tiling preference: at each position we try a full syllable (longest first) OR a bare initial,
+/// via a forward-reachability DP that minimizes the number of tokens (fewest, longest pieces) and,
+/// among those, records how many were bare initials. This keeps `kyi` = k + yi (1 initial) rather
+/// than k + y + i nonsense, matching how a user reads a mixed abbreviation.
+fn abbrev_shape(letters: &str) -> Option<usize> {
+    let n = letters.len();
+    if n < 2 || n > ABBREV_MAX_LEN {
+        return None;
+    }
+    // dp[i] = Some((tokens, initials)) = best tiling of letters[..i]: minimize tokens, then any.
+    let mut dp: Vec<Option<(u32, u32)>> = vec![None; n + 1];
+    dp[0] = Some((0, 0));
+    for i in 0..n {
+        let Some((tok, ini)) = dp[i] else { continue };
+        // full syllables leaving position i
+        for (_, len) in crate::syllable::prefix_syllables(&letters[i..]) {
+            let cand = (tok + 1, ini);
+            let slot = &mut dp[i + len];
+            if slot.map_or(true, |(t, _)| cand.0 < t) {
+                *slot = Some(cand);
+            }
+        }
+        // bare initials leaving position i (1- or 2-char)
+        for (_, len) in crate::syllable::prefix_initials(&letters[i..]) {
+            let cand = (tok + 1, ini + 1);
+            let slot = &mut dp[i + len];
+            if slot.map_or(true, |(t, _)| cand.0 < t || (cand.0 == t && cand.1 > slot.unwrap().1)) {
+                *slot = Some(cand);
+            }
+        }
+    }
+    match dp[n] {
+        Some((tokens, initials)) if tokens >= 2 && initials >= 1 => Some(initials as usize),
+        _ => None,
+    }
+}
+
 /// Decode a single latin run.
 fn decode_latin(
     engine: &Engine,
@@ -383,10 +448,23 @@ fn decode_latin(
         // Is the run shaped like `clean_pinyin_prefix + trailing_fst_english_word`? If so it is
         // almost certainly a Chinese+English mix and the interleaved lattice parse should win.
         let mixy = !is_eng && is_pinyin_prefix_plus_english(engine, &lower);
-        // Is the run a pure pinyin abbreviation (`sbl`, `yghq`)? Then demote the opaque literal so
-        // the abbreviation expansions win the top ranks.
-        let abbrevy = !is_eng && is_abbrev_shaped(&lower);
-        let eng_cost = if is_eng {
+        // Is the run abbreviation-shaped (pure initials `sbl`/`yghq`, OR an initial + full-syllable
+        // mix `kyi`/`bjing`)? Then demote the opaque literal so the abbreviation expansions win the
+        // top ranks. Gated on NOT being clean full pinyin so real words like `nihao` are unaffected.
+        //
+        // Short abbreviations (`nh`, `ky`, `wm`, ≤ 3 letters) are also present in english.fst as
+        // 2-3 letter tokens, but as IME input they are pinyin abbreviations (你好/可以/我们), so for
+        // them abbrev-shape OVERRIDES `is_eng`. For longer runs we keep the `!is_eng` gate: a real
+        // English word (`world`=wo+r+l+d, `code`, `hello`, all ≥4 letters and in english.fst) would
+        // otherwise be spuriously flagged abbrev-shaped and wrongly demoted. The gold `english`
+        // bucket is entirely ≥4-letter real words, so this boundary keeps it at 1.000.
+        let short_abbrev = lower.len() <= 3;
+        let abbrevy = !segments_clean
+            && (short_abbrev || !is_eng)
+            && (is_abbrev_shaped(&lower) || abbrev_shape(&lower).is_some());
+        let eng_cost = if abbrevy {
+            base + ABBREV_LITERAL_PEN + ABBREV_LITERAL_PER_CHAR * (lower.len() as i32)
+        } else if is_eng {
             // Real English word: keep cheap. If it also happens to read as pinyin, nudge up a
             // little but stay competitive (real words like `hello` are still wanted top-1).
             base + if segments_clean { 600 } else { 0 }
@@ -476,7 +554,7 @@ fn build_word_lattice(
     let (words_per_reading, edges_per_start, words_per_span) = if is_abbrev {
         // Pure abbreviations are the most ambiguous and the cheapest to decode (short, ~3 ms p95),
         // so they get the widest caps to maximize coverage of the correct multi-syllable words.
-        (20usize, 200usize, 32usize)
+        (28usize, 280usize, 48usize)
     } else if ambiguous_short {
         if n <= 6 { (16usize, 160usize, 28usize) } else { (12, 96, 18) }
     } else {
@@ -486,7 +564,18 @@ fn build_word_lattice(
     let mut edges_from: Vec<Vec<WordEdge>> = vec![Vec::new(); n];
     for start in 0..n {
         // match_from is computed ONCE per start position here (no per-path recomputation).
-        let matches = engine.lexicon.match_from(lattice, start);
+        // Abbreviation-shaped input gets a much larger node budget so deep multi-initial readings
+        // are reached; everything else keeps the tight default (the dominant latency lever).
+        let matches = if is_abbrev {
+            engine.lexicon.match_from_budgeted(
+                lattice,
+                start,
+                crate::lexicon::ABBREV_NODE_BUDGET,
+                crate::lexicon::ABBREV_MAX_MATCHES,
+            )
+        } else {
+            engine.lexicon.match_from(lattice, start)
+        };
         let mut bucket: Vec<WordEdge> = Vec::new();
         for wm in &matches {
             let mut words = wm.words.clone();
@@ -504,11 +593,48 @@ fn build_word_lattice(
                 0
             };
             for &(word_id, reading_cost) in &words[..take] {
+                // Commercial 简拼 ranking strongly favors covering the input with FEWER, LONGER
+                // dictionary words. We bias the per-edge cost (abbrev input only — gated by the
+                // caller on `!clean && abbrev_shape`):
+                //   * ABBREV_WORD_PER_EDGE  — a flat penalty per Chinese word, so a path made of
+                //     many words pays more in aggregate than one long word covering the same input
+                //     (favors 北京 over 不+部, 我们 over 我+们).
+                //   * ABBREV_SINGLE_CHAR_PEN — an extra penalty on any *single-hanzi* reading, so a
+                //     bare high-frequency character (一/不/部) does not dominate when a real
+                //     multi-char reading of the abbreviation exists (covers both abbrev-matched and
+                //     typo-corrected single chars like `bj`→不).
+                // Both are skipped for English edges (handled later) and for non-abbrev decoding.
+                let (word_penalty, single_pen, multisyl_bonus) = if is_abbrev {
+                    let nchars = engine
+                        .lexicon
+                        .surface(word_id)
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0);
+                    // Demote any single-hanzi reading (whether it covers one initial via abbrev, or
+                    // the whole short run via a typo-corrected single syllable like `bj`→不): the
+                    // user typing an abbreviation wants a word, not a bare frequent character.
+                    let sp = if nchars <= 1 { ABBREV_SINGLE_CHAR_PEN } else { 0 };
+                    // Extra reward for a multi-character word that covers MORE of the abbreviation:
+                    // a single dictionary word spanning the whole 简拼 (受不了 for `sbl`, 中国人 for
+                    // `zgr`) should beat shorter words that cover only a prefix (首播 for `sb`). The
+                    // reward grows with the number of initials covered beyond the first.
+                    let ms = if nchars >= 2 && wm.abbrev {
+                        (span as i32 - 1) * ABBREV_MULTISYL_BONUS
+                    } else {
+                        0
+                    };
+                    (ABBREV_WORD_PER_EDGE, sp, ms)
+                } else {
+                    (0, 0, 0)
+                };
                 bucket.push(WordEdge {
                     start: wm.start,
                     end: wm.end,
                     word_id,
-                    cost: reading_cost as i32 + wm.edit_cost - abbrev_word_bonus,
+                    cost: reading_cost as i32 + wm.edit_cost - abbrev_word_bonus
+                        + word_penalty
+                        + single_pen
+                        - multisyl_bonus,
                 });
             }
         }
@@ -579,16 +705,29 @@ fn beam_search(
     // takes the tight, fast path so its p95 stays < 5 ms (asserted by the latency budget test).
     let clean = segment::fully_segments(norm);
     let ambiguous_short = !clean && n <= 9;
-    // Pure first-initial abbreviation (`sbl`, `yghq`): only here do we reward whole multi-syllable
-    // words reachable by their initial sequence. Gating on this shape prevents the bonus from
-    // leaking abbrev readings into clean pinyin (e.g. `zhongguo` must stay 中国, not 郑洞国).
-    let is_abbrev = !clean && is_abbrev_shaped(&norm.letters);
+    // Abbreviation-shaped input: pure first-initial (`sbl`, `bj`) OR an initial + full-syllable mix
+    // (`kyi` = k+yi, `bjing` = b+jing). Only here do we (a) reward whole multi-syllable words
+    // reachable by their initials, (b) penalize per word so fewer/longer words win, and (c) demote
+    // bare single characters. Gating on `!clean` prevents any of this from leaking into clean full
+    // pinyin (`zhongguo` must stay 中国 not 郑洞国; `wo`→我 / `de`→的 keep their single-char answers).
+    // A real, ≥4-letter English word (`world`, `code`, `hello`) can spuriously match the abbrev
+    // shape (`world` = wo+r+l+d); excluding `is_english` runs longer than the short-abbrev window
+    // keeps the literal passthrough winning for them and avoids spending the large abbrev budget.
+    let is_abbrev = !clean
+        && abbrev_shape(&norm.letters).is_some()
+        && !(n > 3 && engine.lexicon.is_english(&norm.letters));
     let word_edges = build_word_lattice(engine, norm, lattice, n, cfg, ambiguous_short, is_abbrev);
 
     // Effective beam width: the DP cost scales ~ n × width × edges. Short ambiguous runs get a much
     // wider beam (cheap, big recall win); very long runs get a slightly narrower beam to keep the
     // p99/max latency tail comfortably under the budget with negligible recall loss.
-    let width = if ambiguous_short {
+    let width = if is_abbrev {
+        // Abbreviations have the largest fan-out (each initial → ~30 candidate characters) and the
+        // gold phrase is often NOT the locally-cheapest per-character path, so it needs the widest
+        // beam to survive pruning. These inputs are short (≤ ABBREV_MAX_LEN) with ample latency
+        // headroom, so a large multiplier is affordable.
+        if n <= 4 { cfg.beam_width * 8 } else { cfg.beam_width * 5 }
+    } else if ambiguous_short {
         if n <= 6 { cfg.beam_width * 6 } else { cfg.beam_width * 3 }
     } else if n > 22 {
         (cfg.beam_width * 3) / 4
@@ -883,3 +1022,6 @@ fn merge_kind(a: CandidateKind, b: CandidateKind, a_empty: bool, b_empty: bool) 
         CandidateKind::Mixed
     }
 }
+
+
+

@@ -124,15 +124,15 @@ and on-disk data size. Output is a human-readable table **and** `report.json`.
 bucket              n    top1    top5   top10     mrr char_acc     cer coverage
 -------------------------------------------------------------------------------
 full              600   0.612   0.807   0.855   0.701    0.897   0.103    0.867
-abbr              599   0.072   0.209   0.275   0.134    0.127   0.873    0.342
+abbr              599   0.087   0.217   0.297   0.149    0.136   0.864    0.377
 fuzzy             600   0.518   0.695   0.745   0.596    0.857   0.143    0.773
-typo              600   0.332   0.458   0.493   0.381    0.747   0.253    0.520
+typo              600   0.333   0.453   0.487   0.380    0.754   0.246    0.517
 english            40   1.000   1.000   1.000   1.000    1.000   0.000    1.000
-mixed             257   0.681   0.805   0.833   0.734    0.891   0.109    0.844
+mixed             257   0.681   0.802   0.829   0.733    0.889   0.111    0.840
 long_sentence     600   0.580   0.770   0.818   0.666    0.913   0.087    0.835
 short_word        111   0.748   0.937   0.982   0.830    0.815   0.185    0.982
 -------------------------------------------------------------------------------
-OVERALL          3407   0.460   0.620   0.668   0.530    0.729   0.271    0.695
+OVERALL          3407   0.463   0.621   0.670   0.533    0.732   0.268    0.700
 Latency: p50 8.4ms  p95 21.7ms   |   RSS 37 MiB   |   data 45.7 MiB
 ```
 
@@ -149,7 +149,8 @@ The engine was tuned **using the eval harness as the objective function**. OVERA
 | Corpus/LM upgrade | 0.186 | 0.352 | 0.449 | 0.260 | freq-ranked english |
 | **rime-ice lexicon** | 0.275 | 0.458 | 0.553 | 0.408 | correct readings |
 | **smoothed trigram LM** | 0.414 | 0.620 | 0.695 | 0.610 | the big lever |
-| **literal-demotion** | **0.460** | **0.620** | **0.695** | **0.612** | typo 0.10→0.33 |
+| **literal-demotion** | 0.460 | 0.620 | 0.695 | 0.612 | typo 0.10→0.33 |
+| **简拼 word-boost** | **0.463** | **0.621** | **0.698** | **0.612** | kyi→可以, bj→北京 #1 |
 
 The two dominant levers were the **curated lexicon** (correct readings) and the **smoothed
 trigram LM** — exactly as in commercial systems. On the controlled A/B over the 980 sentences
