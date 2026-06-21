@@ -243,6 +243,29 @@ pub fn fully_segments(norm: &Normalized) -> bool {
     reachable[n]
 }
 
+/// True if the sub-slice `letters[start..end]` can be tiled *entirely* by exact canonical pinyin
+/// syllables. Used to suppress in-lattice English edges over spans that also read as clean pinyin
+/// (e.g. `hehe` → 呵呵 must not be diverted to a latin `hehe` edge), while genuine English suffixes
+/// like `search` / `browser` / `model` (which do not segment) still get an English edge.
+pub fn span_fully_segments(letters: &str, start: usize, end: usize) -> bool {
+    if start >= end || end > letters.len() {
+        return false;
+    }
+    let span = &letters[start..end];
+    let m = span.len();
+    let mut reachable = vec![false; m + 1];
+    reachable[0] = true;
+    for s in 0..m {
+        if !reachable[s] {
+            continue;
+        }
+        for (_, len) in syllable::prefix_syllables(&span[s..]) {
+            reachable[s + len] = true;
+        }
+    }
+    reachable[m]
+}
+
 /// Build the syllable lattice over the normalized letters. Returns edges grouped by start
 /// position: `edges_from[i]` lists all edges leaving letter index `i`.
 pub fn build_lattice(norm: &Normalized, cfg: &EngineConfig) -> Vec<Vec<Edge>> {
@@ -363,3 +386,4 @@ mod tests {
             .any(|e| e.syllable == "zhong" && e.cost >= FUZZY_PEN));
     }
 }
+

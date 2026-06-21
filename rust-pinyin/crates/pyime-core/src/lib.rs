@@ -68,7 +68,7 @@ impl Default for EngineConfig {
             correction_max_edits: 1,
             enable_english: true,
             max_candidates: 20,
-            beam_width: 32,
+            beam_width: 20,
         }
     }
 }

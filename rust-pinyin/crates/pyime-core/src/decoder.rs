@@ -27,9 +27,48 @@ const ENGLISH_PER_CHAR_PEN: i32 = 220;
 const ENGLISH_FULLY_SEGMENTS_PER_CHAR: i32 = 950;
 /// Floor for the fully-segments penalty so very short clean runs still lose to Chinese.
 const ENGLISH_FULLY_SEGMENTS_MIN: i32 = 4000;
-/// Penalty for an out-of-vocabulary latin run that is *not* a real English word and does not
-/// fully segment into pinyin (junk). Lower than the fully-segments case but still a clear band.
+/// Penalty for a plain out-of-vocabulary latin run that is not a real English word, does not fully
+/// segment into pinyin, and is neither abbreviation-shaped nor `pinyin+english`-shaped (e.g.
+/// `github`, `keyboard`, `linux`). Kept moderate so these stay as a clean whole-run literal; the
+/// mixed/abbrev shapes get their own, larger penalties so the lattice parse wins for them instead.
 const ENGLISH_OOV_PEN: i32 = 1500;
+/// Penalty added to the whole-run literal when the run is recognizably `clean_pinyin_prefix +
+/// trailing_fst_english_word` (e.g. `shoubulesearch`, `shuiluanpenhello`). In that case the run is
+/// almost certainly a Chinese+English mix and the lattice's interleaved parse should win, so the
+/// opaque whole-run literal is pushed down. Plain OOV latin tokens (github, keyboard, linux) do not
+/// match this shape and keep their cheap literal.
+const ENGLISH_MIXY_PEN: i32 = 9000;
+/// Per-letter component of the mixy penalty so the whole-run literal stays below the (length-
+/// scaled) cost of the interleaved pinyin+english parse even for long mixed runs.
+const ENGLISH_MIXY_PER_CHAR: i32 = 700;
+
+/// Maximum length of an all-initials run still treated as a pinyin abbreviation (`sbl`, `yghq`,
+/// `hlfx`, `ssyb`, ...). Beyond this it is more likely a real (English) token.
+const ABBREV_MAX_LEN: usize = 8;
+/// Penalty added to the whole-run English literal when the run is abbreviation-shaped, so the
+/// abbreviation expansions (e.g. `sbl` → 受不了) win the top ranks instead of the opaque literal.
+/// Scales per initial because each extra abbreviated syllable adds a full word (and bigram) to the
+/// Chinese expansion's cost; a flat penalty would let the literal resurface for 4+ letter abbrevs.
+const ABBREV_LITERAL_PEN: i32 = 6000;
+const ABBREV_LITERAL_PER_CHAR: i32 = 3500;
+
+/// Minimum length of an in-lattice English sub-span edge. Short 1-2 letter "words" in english.fst
+/// (a, i, of, ...) would over-fire and interfere with pinyin segmentation, so we require ≥3.
+const ENGLISH_MIN_LEN: usize = 4;
+/// Base cost of an in-lattice English edge. Tuned so a genuine embedded English word (e.g.
+/// `search`, `browser`) competes with — and usually beats — reading those letters as junk pinyin,
+/// while a single English edge spanning a whole clean-pinyin run stays more expensive than the
+/// Chinese reading (handled by the per-char term + the whole-run passthrough penalty band).
+const ENGLISH_EDGE_BASE: i32 = 1800;
+/// Per-letter cost of an in-lattice English edge (keeps long latin runs from preferring one big
+/// English edge over their pinyin reading).
+const ENGLISH_EDGE_PER_CHAR: i32 = 110;
+/// Surcharge for an English edge that does NOT reach the end of the latin run. The canonical mixed
+/// pattern is `pinyin_prefix + english_suffix` (the English word terminates the run), so an English
+/// edge embedded in the middle — which would leave a forced-junk pinyin tail like `gith` + 不 in an
+/// OOV latin word — is made costly. This keeps OOV-but-latin words (github, message) as a clean
+/// whole-run literal while still allowing a true trailing English word to split off.
+const ENGLISH_EDGE_NONTERMINAL_PEN: i32 = 4000;
 
 /// A partial decoded result over one chunk (or the combined whole).
 #[derive(Clone)]
@@ -170,6 +209,85 @@ fn literal_partial(text: &str, byte_start: usize) -> Partial {
     }
 }
 
+/// True if `letters` splits as `clean_pinyin_prefix + trailing_english_word`, i.e. there is a cut
+/// `k` (with a non-empty pinyin prefix) such that `letters[..k]` tiles entirely into canonical
+/// pinyin syllables and `letters[k..]` is a complete word in english.fst (length ≥ ENGLISH_MIN_LEN).
+/// This is the canonical Chinese+English mixed shape (`shoubule`+`search`, `shuiluanpen`+`hello`);
+/// plain OOV latin tokens (github, keyboard, linux) do not match it.
+fn is_pinyin_prefix_plus_english(engine: &Engine, letters: &str) -> bool {
+    let n = letters.len();
+    if n < 2 {
+        return false;
+    }
+    // reachable[i] = letters[..i] tiles into pinyin syllables.
+    let bytes = letters.as_bytes();
+    let mut reachable = vec![false; n + 1];
+    reachable[0] = true;
+    for s in 0..n {
+        if !reachable[s] {
+            continue;
+        }
+        for (_, len) in crate::syllable::prefix_syllables(&letters[s..]) {
+            reachable[s + len] = true;
+        }
+    }
+    let _ = bytes;
+    for k in 1..n {
+        if !reachable[k] {
+            continue;
+        }
+        if (n - k) < ENGLISH_MIN_LEN {
+            continue;
+        }
+        // The suffix is a (near-)complete English word if matching from k reaches the run end.
+        if engine
+            .lexicon
+            .english_matches_from(letters, k, ENGLISH_MIN_LEN)
+            .iter()
+            .any(|&e| e == n)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if a latin run looks like a pure first-initial pinyin abbreviation (`sbl` → 受不了, `yghq`,
+/// `hlfx`): it can be tiled *entirely* by consonant-initial abbreviation tokens (b, p, ..., zh/ch/sh)
+/// without using any full syllable, and it is short enough to be an abbreviation rather than a word.
+/// Such runs should not be passed through as an opaque English literal; the abbreviation expansions
+/// (recombined by the bigram LM) should rank at the top instead.
+fn is_abbrev_shaped(letters: &str) -> bool {
+    let n = letters.len();
+    if n < 2 || n > ABBREV_MAX_LEN {
+        return false;
+    }
+    // Greedily tile by initials (prefer 2-char zh/ch/sh). Every position must be an initial.
+    let bytes = letters.as_bytes();
+    let mut i = 0;
+    let mut tokens = 0;
+    while i < n {
+        let two = if i + 2 <= n { Some(&letters[i..i + 2]) } else { None };
+        if let Some(t) = two {
+            if crate::syllable::is_initial(t) {
+                i += 2;
+                tokens += 1;
+                continue;
+            }
+        }
+        let one = &letters[i..i + 1];
+        if crate::syllable::is_initial(one) {
+            i += 1;
+            tokens += 1;
+            continue;
+        }
+        return false;
+    }
+    let _ = bytes;
+    // Need at least two abbreviated syllables (a single initial is just a partial syllable).
+    tokens >= 2
+}
+
 /// Decode a single latin run.
 fn decode_latin(
     engine: &Engine,
@@ -196,6 +314,12 @@ fn decode_latin(
         // real English word (in english.fst) so `github`/`hello` win, and raised when the run also
         // fully segments into clean pinyin so `nihao`→你好 / `zhongguo`→中国 win.
         let base = ENGLISH_PEN + ENGLISH_PER_CHAR_PEN * (lower.len() as i32);
+        // Is the run shaped like `clean_pinyin_prefix + trailing_fst_english_word`? If so it is
+        // almost certainly a Chinese+English mix and the interleaved lattice parse should win.
+        let mixy = !is_eng && is_pinyin_prefix_plus_english(engine, &lower);
+        // Is the run a pure pinyin abbreviation (`sbl`, `yghq`)? Then demote the opaque literal so
+        // the abbreviation expansions win the top ranks.
+        let abbrevy = !is_eng && is_abbrev_shaped(&lower);
         let eng_cost = if is_eng {
             // Real English word: keep cheap. If it also happens to read as pinyin, nudge up a
             // little but stay competitive (real words like `hello` are still wanted top-1).
@@ -203,6 +327,10 @@ fn decode_latin(
         } else if segments_clean {
             base + (ENGLISH_FULLY_SEGMENTS_PER_CHAR * (lower.len() as i32))
                 .max(ENGLISH_FULLY_SEGMENTS_MIN)
+        } else if mixy {
+            base + ENGLISH_MIXY_PEN + ENGLISH_MIXY_PER_CHAR * (lower.len() as i32)
+        } else if abbrevy {
+            base + ABBREV_LITERAL_PEN + ABBREV_LITERAL_PER_CHAR * (lower.len() as i32)
         } else {
             base + ENGLISH_OOV_PEN
         };
@@ -233,8 +361,15 @@ fn decode_latin(
     results
 }
 
+/// Sentinel `word_id` marking an English (latin-surface) edge inside the word lattice. These edges
+/// let a contiguous latin run interleave pinyin syllables with English words (`shoubulesearch` →
+/// 受不了 + search), instead of treating the whole run as all-pinyin or all-english.
+const ENGLISH_EDGE: u32 = u32::MAX;
+
 /// A flattened word-lattice edge: word `word_id` covers letters `[start, end)` for `cost`.
 /// Derived ONCE from the memoized `match_from` results, independent of decode history.
+/// When `word_id == ENGLISH_EDGE`, the edge emits the latin surface `letters[start..end]` instead
+/// of a dictionary word, and contributes no language-model history.
 #[derive(Clone)]
 struct WordEdge {
     start: usize,
@@ -258,14 +393,29 @@ struct VNode {
 /// Build the flattened word lattice from memoized `match_from` results. Each reading keeps only
 /// the cheapest `WORDS_PER_READING` words (postings are already capped in the lexicon), so the
 /// number of word edges per start position is bounded.
-fn build_word_lattice(engine: &Engine, lattice: &[Vec<Edge>], n: usize) -> Vec<Vec<WordEdge>> {
-    const WORDS_PER_READING: usize = 4;
-    /// Cap on word edges kept per start position. The lattice already bounds matches, but a single
-    /// start can still yield hundreds of (reading × word) edges; we keep only the cheapest few per
-    /// distinct end position so the DP frontier stays small (this is the dominant perf lever).
-    const EDGES_PER_START: usize = 24;
-    /// Per (start,end) span, keep at most this many cheapest words (different surfaces, same span).
-    const WORDS_PER_SPAN: usize = 6;
+fn build_word_lattice(
+    engine: &Engine,
+    norm: &Normalized,
+    lattice: &[Vec<Edge>],
+    n: usize,
+    cfg: &EngineConfig,
+    ambiguous_short: bool,
+    is_abbrev: bool,
+) -> Vec<Vec<WordEdge>> {
+    // Short, highly-ambiguous runs (abbreviations like `yghq` → 浴缸很浅) need many alternative
+    // words per span to be retained — the correct multi-syllable word is frequently NOT the most
+    // frequent reading of its initials, so a tight per-span cap drops it and tanks coverage. We
+    // widen the word caps only for those (and only when short, so latency stays bounded); clean
+    // full pinyin and long runs keep the tight caps that are the dominant perf lever.
+    let (words_per_reading, edges_per_start, words_per_span) = if is_abbrev {
+        // Pure abbreviations are the most ambiguous and the cheapest to decode (short, ~3 ms p95),
+        // so they get the widest caps to maximize coverage of the correct multi-syllable words.
+        (20usize, 200usize, 32usize)
+    } else if ambiguous_short {
+        if n <= 6 { (16usize, 160usize, 28usize) } else { (12, 96, 18) }
+    } else {
+        (9, 56, 12)
+    };
 
     let mut edges_from: Vec<Vec<WordEdge>> = vec![Vec::new(); n];
     for start in 0..n {
@@ -275,31 +425,65 @@ fn build_word_lattice(engine: &Engine, lattice: &[Vec<Edge>], n: usize) -> Vec<V
         for wm in &matches {
             let mut words = wm.words.clone();
             words.sort_unstable_by_key(|(_, c)| *c);
-            let take = words.len().min(WORDS_PER_READING);
+            let take = words.len().min(words_per_reading);
+            // Reward a *whole multi-syllable dictionary word* matched by its initial sequence (e.g.
+            // 受不了 from `sbl`, 浴缸 from `yg`): such a word stacks one ABBR_PEN per initial, which
+            // otherwise buries it under single-character abbrev recombinations. Refund most of the
+            // per-initial penalties beyond the first so a real word reachable by its initials ranks
+            // — and survives the per-span cap — alongside the single-char paths.
+            let span = wm.end - wm.start;
+            let abbrev_word_bonus = if is_abbrev && wm.abbrev && span >= 2 {
+                ((span as i32 - 1) * crate::consts::ABBR_PEN * 3) / 4
+            } else {
+                0
+            };
             for &(word_id, reading_cost) in &words[..take] {
                 bucket.push(WordEdge {
                     start: wm.start,
                     end: wm.end,
                     word_id,
-                    cost: reading_cost as i32 + wm.edit_cost,
+                    cost: reading_cost as i32 + wm.edit_cost - abbrev_word_bonus,
                 });
             }
         }
         // Cheapest first; then keep only WORDS_PER_SPAN per end position, capped overall.
         bucket.sort_unstable_by(|a, b| a.cost.cmp(&b.cost));
         let mut per_end: FxHashMap<usize, usize> = FxHashMap::default();
-        let mut kept: Vec<WordEdge> = Vec::with_capacity(EDGES_PER_START);
+        let mut kept: Vec<WordEdge> = Vec::with_capacity(edges_per_start);
         for e in bucket {
             let c = per_end.entry(e.end).or_insert(0);
-            if *c >= WORDS_PER_SPAN {
+            if *c >= words_per_span {
                 continue;
             }
             *c += 1;
             kept.push(e);
-            if kept.len() >= EDGES_PER_START {
+            if kept.len() >= edges_per_start {
                 break;
             }
         }
+
+        // English sub-span edges: any prefix of `letters[start..]` that is a real English word
+        // (in english.fst) becomes an edge so the lattice can interleave English with pinyin.
+        // These are added on top of the dictionary edges (and not subject to the per-end cap) so
+        // an embedded English run like `search` in `shoubulesearch` always survives.
+        if cfg.enable_english {
+            for end in engine.lexicon.english_matches_from(&norm.letters, start, ENGLISH_MIN_LEN) {
+                // Skip English edges over spans that also read as clean pinyin: those should be
+                // decoded as Chinese (e.g. `hehe` → 呵呵), not diverted to a latin surface. Genuine
+                // English suffixes (`search`, `browser`, `model`) don't fully segment, so they keep
+                // their edge and the lattice can interleave them with pinyin.
+                if segment::span_fully_segments(&norm.letters, start, end) {
+                    continue;
+                }
+                let len = (end - start) as i32;
+                let mut cost = ENGLISH_EDGE_BASE + ENGLISH_EDGE_PER_CHAR * len;
+                if end != n {
+                    cost += ENGLISH_EDGE_NONTERMINAL_PEN;
+                }
+                kept.push(WordEdge { start, end, word_id: ENGLISH_EDGE, cost });
+            }
+        }
+
         edges_from[start] = kept;
     }
     edges_from
@@ -322,10 +506,32 @@ fn beam_search(
     if n == 0 {
         return Vec::new();
     }
-    let word_edges = build_word_lattice(engine, lattice, n);
+
+    // Highly-ambiguous SHORT runs that do NOT read as clean full pinyin — i.e. abbreviations
+    // (`yghq` → 浴缸很浅) and short fuzzy/typo inputs — benefit from a much wider beam and word
+    // lattice, and short runs have ample latency headroom. Clean full pinyin (`nihao`, `zhongguo`)
+    // takes the tight, fast path so its p95 stays < 5 ms (asserted by the latency budget test).
+    let clean = segment::fully_segments(norm);
+    let ambiguous_short = !clean && n <= 9;
+    // Pure first-initial abbreviation (`sbl`, `yghq`): only here do we reward whole multi-syllable
+    // words reachable by their initial sequence. Gating on this shape prevents the bonus from
+    // leaking abbrev readings into clean pinyin (e.g. `zhongguo` must stay 中国, not 郑洞国).
+    let is_abbrev = !clean && is_abbrev_shaped(&norm.letters);
+    let word_edges = build_word_lattice(engine, norm, lattice, n, cfg, ambiguous_short, is_abbrev);
+
+    // Effective beam width: the DP cost scales ~ n × width × edges. Short ambiguous runs get a much
+    // wider beam (cheap, big recall win); very long runs get a slightly narrower beam to keep the
+    // p99/max latency tail comfortably under the budget with negligible recall loss.
+    let width = if ambiguous_short {
+        if n <= 6 { cfg.beam_width * 6 } else { cfg.beam_width * 3 }
+    } else if n > 22 {
+        (cfg.beam_width * 3) / 4
+    } else {
+        cfg.beam_width
+    };
 
     // Arena of DP nodes. Node 0 is the origin (empty prefix at pos 0).
-    let mut arena: Vec<VNode> = Vec::with_capacity(n * cfg.beam_width.max(1));
+    let mut arena: Vec<VNode> = Vec::with_capacity(n * width.max(1));
     arena.push(VNode { score: 0, word_id: u32::MAX, edge: u32::MAX, prev: usize::MAX });
 
     // frontier[pos] = arena node indices whose consumed input ends exactly at letter `pos`.
@@ -345,7 +551,7 @@ fn beam_search(
             continue;
         }
         // Beam-prune the frontier at this position (cheapest first).
-        beam_prune(&mut frontier[pos], &arena, cfg.beam_width);
+        beam_prune(&mut frontier[pos], &arena, width);
         let frontier_pos = frontier[pos].clone();
 
         let (off, len) = edge_start[pos];
@@ -354,7 +560,12 @@ fn beam_search(
             for &prev_idx in &frontier_pos {
                 let prev = arena[prev_idx];
                 let prev_word = if prev.word_id == u32::MAX { None } else { Some(prev.word_id) };
-                let trans = engine.lm.transition_cost(prev_word, we.word_id) as i32;
+                // English edges carry no language-model identity: no transition into them.
+                let trans = if we.word_id == ENGLISH_EDGE {
+                    0
+                } else {
+                    engine.lm.transition_cost(prev_word, we.word_id) as i32
+                };
                 let new_score = prev.score + we.cost + trans;
                 let node_idx = arena.len();
                 arena.push(VNode {
@@ -376,10 +587,14 @@ fn beam_search(
             return None; // origin only, no words consumed
         }
         let final_score = node.score + extra;
-        let last_word_id = Some(node.word_id);
+        // last_word_id is the LM history this partial exposes to its right neighbor; an English
+        // edge carries no LM identity, so fall through to None for it.
+        let last_word_id = if node.word_id == ENGLISH_EDGE { None } else { Some(node.word_id) };
         let mut segs: Vec<Segment> = Vec::new();
         let mut text = String::new();
         let mut first_word_id = None;
+        let mut saw_chinese = false;
+        let mut saw_english = false;
         // Walk backpointers, collecting edges (reverse order).
         let mut chain: Vec<u32> = Vec::new();
         loop {
@@ -387,27 +602,41 @@ fn beam_search(
                 break;
             }
             chain.push(node.edge);
-            first_word_id = Some(node.word_id);
+            first_word_id = if node.word_id == ENGLISH_EDGE { None } else { Some(node.word_id) };
             idx = node.prev;
             node = arena[idx];
         }
         chain.reverse();
         for &ei in &chain {
             let we = &flat[ei as usize];
-            let surface = engine.lexicon.surface(we.word_id).unwrap_or_default();
             let span_start = byte_start + norm.orig_byte[we.start];
             let span_end = byte_start + norm.orig_end[we.end - 1];
             let reading = norm.letters[we.start..we.end].to_string();
-            text.push_str(&surface);
-            segs.push(Segment { text: surface, reading, input_span: (span_start, span_end) });
+            if we.word_id == ENGLISH_EDGE {
+                // English sub-span: emit the latin surface verbatim.
+                let surface = norm.letters[we.start..we.end].to_string();
+                saw_english = true;
+                text.push_str(&surface);
+                segs.push(Segment { text: surface, reading: String::new(), input_span: (span_start, span_end) });
+            } else {
+                let surface = engine.lexicon.surface(we.word_id).unwrap_or_default();
+                saw_chinese = true;
+                text.push_str(&surface);
+                segs.push(Segment { text: surface, reading, input_span: (span_start, span_end) });
+            }
         }
+        let kind = match (saw_chinese, saw_english) {
+            (true, true) => CandidateKind::Mixed,
+            (false, true) => CandidateKind::English,
+            _ => CandidateKind::Chinese,
+        };
         Some(Partial {
             text,
             score: final_score,
             segments: segs,
             last_word_id,
             first_word_id,
-            kind: CandidateKind::Chinese,
+            kind,
         })
     };
 
@@ -421,7 +650,13 @@ fn beam_search(
             }
         }
     } else {
-        for &idx in &frontier[n] {
+        // Reconstruct only the cheapest terminal nodes (reconstruction allocates strings, so
+        // bounding this is a key latency lever). The cap is generous enough to keep N-best diverse.
+        let mut terminals = frontier[n].clone();
+        terminals.sort_unstable_by_key(|&i| arena[i].score);
+        let recon_cap = (cfg.max_candidates * 3).max(width);
+        terminals.truncate(recon_cap);
+        for &idx in &terminals {
             if let Some(p) = reconstruct(idx, 0) {
                 out.push(p);
             }
@@ -434,20 +669,25 @@ fn beam_search(
 /// `last_word_id` keeping the best per language-model history (so the beam carries diverse states
 /// rather than `width` copies of the same word).
 fn beam_prune(frontier: &mut Vec<usize>, arena: &[VNode], width: usize) {
+    /// Keep up to this many distinct DP nodes per last_word_id (rather than collapsing to one),
+    /// so alternate language-model histories ending on the same word survive into reconstruction.
+    /// This is the main recall lever for N-best diversity without inflating the raw beam width.
+    const PER_WORD_KEEP: usize = 5;
     if frontier.len() > 1 {
-        // keep cheapest per last_word_id
-        let mut best: FxHashMap<u32, usize> = FxHashMap::default();
+        // keep the cheapest few per last_word_id
+        frontier.sort_unstable_by_key(|&i| arena[i].score);
+        let mut per_word: FxHashMap<u32, usize> = FxHashMap::default();
+        let mut kept: Vec<usize> = Vec::with_capacity(frontier.len().min(width));
         for &idx in frontier.iter() {
             let wid = arena[idx].word_id;
-            match best.get(&wid) {
-                Some(&j) if arena[j].score <= arena[idx].score => {}
-                _ => {
-                    best.insert(wid, idx);
-                }
+            let c = per_word.entry(wid).or_insert(0);
+            if *c >= PER_WORD_KEEP {
+                continue;
             }
+            *c += 1;
+            kept.push(idx);
         }
-        frontier.clear();
-        frontier.extend(best.into_values());
+        *frontier = kept;
     }
     if frontier.len() <= width {
         frontier.sort_unstable_by_key(|&i| arena[i].score);

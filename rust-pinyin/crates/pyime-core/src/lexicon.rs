@@ -116,6 +116,47 @@ impl Lexicon {
         }
     }
 
+    /// Enumerate end positions `end` such that `letters[start..end]` is (close to) a complete word
+    /// in the English vocabulary. Walks the english FST byte-by-byte from `start`, emitting every
+    /// prefix that terminates a key. `min_len` filters out trivially short matches.
+    ///
+    /// Many common English words are present only as a stem in the vocabulary (e.g. `browse` but not
+    /// `browser`, `intern`/`internet`). To still split those off, if the walk reaches the *end of the
+    /// run* (`pos == n`) within a few extra bytes after having passed through a final node, that
+    /// run-end position is also emitted. This is gated on reaching the run end so it never fires
+    /// mid-run (which would create junk like `gith` + 不).
+    pub fn english_matches_from(&self, letters: &str, start: usize, min_len: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let Some(f) = &self.english else { return out };
+        let bytes = letters.as_bytes();
+        let n = bytes.len();
+        let mut node = f.root();
+        let mut pos = start;
+        let mut last_final: Option<usize> = None;
+        /// Max trailing bytes allowed past the last final node when extending to the run end.
+        const TRAIL_SLACK: usize = 2;
+        while pos < n {
+            let b = bytes[pos];
+            let Some(i) = node.find_input(b) else { break };
+            let t = node.transition(i);
+            node = f.node(t.addr);
+            pos += 1;
+            if node.is_final() && (pos - start) >= min_len {
+                out.push(pos);
+                last_final = Some(pos);
+            }
+        }
+        // Reached the run end with a near-complete word? Emit the run end too.
+        if pos == n {
+            if let Some(lf) = last_final {
+                if lf != n && (n - lf) <= TRAIL_SLACK && (n - start) >= min_len {
+                    out.push(n);
+                }
+            }
+        }
+        out
+    }
+
     #[inline]
     fn archived_words(&self) -> &ArchivedVec {
         // Safe: validated in `load`.
@@ -374,44 +415,8 @@ fn mmap(path: &Path) -> anyhow::Result<Mmap> {
     Ok(m)
 }
 
-#[cfg(test)]
-mod probe_tests {
-    use super::*;
-    use std::path::Path;
-    #[test]
-    fn probe_keys() {
-        let dir = Path::new("../../data");
-        if !dir.join("lexicon.fst").exists() { return; }
-        let lex = Lexicon::load(dir).unwrap();
-        for key in ["shou'bu'le","shou'bu'liao","yu'gang'hen'qian","hou'lai'fa'xian","he'he","shou'bu","shou'bu'le'search"] {
-            match lex.lookup_exact(key) {
-                Some(v) => {
-                    let s: Vec<String> = v.iter().take(5).map(|(id,c)| format!("{}({})", lex.surface(*id).unwrap_or_default(), c)).collect();
-                    println!("PROBE {:>20} -> {:?}", key, s);
-                }
-                None => println!("PROBE {:>20} -> NONE", key),
-            }
-        }
-    }
-}
 
-#[cfg(test)]
-mod probe_tests2 {
-    use super::*;
-    use std::path::Path;
-    #[test]
-    fn probe_keys2() {
-        let dir = Path::new("../../data");
-        if !dir.join("lexicon.fst").exists() { return; }
-        let lex = Lexicon::load(dir).unwrap();
-        for key in ["le","liao","shou","bu","bu'le","shou'bu'le","yu'gang","hen'qian","hen'qian'qian","yu","gang","hen","qian"] {
-            match lex.lookup_exact(key) {
-                Some(v) => {
-                    let s: Vec<String> = v.iter().take(6).map(|(id,c)| format!("{}({})", lex.surface(*id).unwrap_or_default(), c)).collect();
-                    println!("PB2 {:>16} -> {:?}", key, s);
-                }
-                None => println!("PB2 {:>16} -> NONE", key),
-            }
-        }
-    }
-}
+
+
+
+
