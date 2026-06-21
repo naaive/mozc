@@ -20,9 +20,13 @@ const LITERAL_PASS_COST: i32 = 50; // tiny cost for literal CJK passthrough segm
 /// really pinyin don't win by being "english").
 const ENGLISH_PER_CHAR_PEN: i32 = 220;
 /// Extra penalty when an out-of-vocabulary latin run *also* fully segments into clean pinyin
-/// (e.g. `nihao`, `zhongguo`): the Chinese reading should win, so push the literal passthrough
-/// well above any reasonable Chinese sentence cost — but keep it present as a survivor.
-const ENGLISH_FULLY_SEGMENTS_PEN: i32 = 9000;
+/// (e.g. `nihao`, `zhongguo`, `womendoushihaohaizi`): the Chinese reading should win. A Chinese
+/// sentence's cost grows with its word count (unigram + bigram-backoff per word), so this penalty
+/// is applied *per input letter* — a long clean-pinyin run then always loses to its Chinese
+/// reading, while the literal passthrough still survives in the list.
+const ENGLISH_FULLY_SEGMENTS_PER_CHAR: i32 = 950;
+/// Floor for the fully-segments penalty so very short clean runs still lose to Chinese.
+const ENGLISH_FULLY_SEGMENTS_MIN: i32 = 4000;
 /// Penalty for an out-of-vocabulary latin run that is *not* a real English word and does not
 /// fully segment into pinyin (junk). Lower than the fully-segments case but still a clear band.
 const ENGLISH_OOV_PEN: i32 = 1500;
@@ -197,7 +201,8 @@ fn decode_latin(
             // little but stay competitive (real words like `hello` are still wanted top-1).
             base + if segments_clean { 600 } else { 0 }
         } else if segments_clean {
-            base + ENGLISH_FULLY_SEGMENTS_PEN
+            base + (ENGLISH_FULLY_SEGMENTS_PER_CHAR * (lower.len() as i32))
+                .max(ENGLISH_FULLY_SEGMENTS_MIN)
         } else {
             base + ENGLISH_OOV_PEN
         };
@@ -228,7 +233,83 @@ fn decode_latin(
     results
 }
 
-/// Beam search state keyed by (position, last_word_id). We keep best partials per position.
+/// A flattened word-lattice edge: word `word_id` covers letters `[start, end)` for `cost`.
+/// Derived ONCE from the memoized `match_from` results, independent of decode history.
+#[derive(Clone)]
+struct WordEdge {
+    start: usize,
+    end: usize,
+    word_id: u32,
+    /// reading_cost + edit_cost (history-independent part of the edge cost).
+    cost: i32,
+}
+
+/// A node in the Viterbi DP arena. `prev` indexes back into the arena (usize::MAX = origin).
+/// We never copy strings/segments during search — only scores + backpointers. Top-N candidates
+/// are reconstructed from backpointers at the end.
+#[derive(Clone, Copy)]
+struct VNode {
+    score: i32,
+    word_id: u32,
+    edge: u32, // index into the flattened word-edge list (for span/reading reconstruction)
+    prev: usize,
+}
+
+/// Build the flattened word lattice from memoized `match_from` results. Each reading keeps only
+/// the cheapest `WORDS_PER_READING` words (postings are already capped in the lexicon), so the
+/// number of word edges per start position is bounded.
+fn build_word_lattice(engine: &Engine, lattice: &[Vec<Edge>], n: usize) -> Vec<Vec<WordEdge>> {
+    const WORDS_PER_READING: usize = 4;
+    /// Cap on word edges kept per start position. The lattice already bounds matches, but a single
+    /// start can still yield hundreds of (reading × word) edges; we keep only the cheapest few per
+    /// distinct end position so the DP frontier stays small (this is the dominant perf lever).
+    const EDGES_PER_START: usize = 24;
+    /// Per (start,end) span, keep at most this many cheapest words (different surfaces, same span).
+    const WORDS_PER_SPAN: usize = 6;
+
+    let mut edges_from: Vec<Vec<WordEdge>> = vec![Vec::new(); n];
+    for start in 0..n {
+        // match_from is computed ONCE per start position here (no per-path recomputation).
+        let matches = engine.lexicon.match_from(lattice, start);
+        let mut bucket: Vec<WordEdge> = Vec::new();
+        for wm in &matches {
+            let mut words = wm.words.clone();
+            words.sort_unstable_by_key(|(_, c)| *c);
+            let take = words.len().min(WORDS_PER_READING);
+            for &(word_id, reading_cost) in &words[..take] {
+                bucket.push(WordEdge {
+                    start: wm.start,
+                    end: wm.end,
+                    word_id,
+                    cost: reading_cost as i32 + wm.edit_cost,
+                });
+            }
+        }
+        // Cheapest first; then keep only WORDS_PER_SPAN per end position, capped overall.
+        bucket.sort_unstable_by(|a, b| a.cost.cmp(&b.cost));
+        let mut per_end: FxHashMap<usize, usize> = FxHashMap::default();
+        let mut kept: Vec<WordEdge> = Vec::with_capacity(EDGES_PER_START);
+        for e in bucket {
+            let c = per_end.entry(e.end).or_insert(0);
+            if *c >= WORDS_PER_SPAN {
+                continue;
+            }
+            *c += 1;
+            kept.push(e);
+            if kept.len() >= EDGES_PER_START {
+                break;
+            }
+        }
+        edges_from[start] = kept;
+    }
+    edges_from
+}
+
+/// Viterbi / beam DP over the word lattice with state `(position, last_word_id)`.
+///
+/// `best[pos]` keeps, per `last_word_id`, the cheapest arena node ending at `pos` (so distinct
+/// language-model histories survive), beam-pruned to `cfg.beam_width`. No per-path string/segment
+/// work happens inside the loop — only score arithmetic and backpointer bookkeeping.
 fn beam_search(
     engine: &Engine,
     norm: &Normalized,
@@ -238,99 +319,148 @@ fn beam_search(
     predict: bool,
 ) -> Vec<Partial> {
     let n = norm.letters.len();
-    // beams[pos] = list of partials whose consumed input ends exactly at letter `pos`.
-    let mut beams: Vec<Vec<Partial>> = vec![Vec::new(); n + 1];
-    beams[0].push(Partial {
-        text: String::new(),
-        score: 0,
-        segments: Vec::new(),
-        last_word_id: None,
-        first_word_id: None,
-        kind: CandidateKind::Chinese,
-    });
+    if n == 0 {
+        return Vec::new();
+    }
+    let _dbg = std::env::var("PYIME_DBG").is_ok();
+    let _t0 = std::time::Instant::now();
+    let word_edges = build_word_lattice(engine, lattice, n);
+    if _dbg {
+        let ne: usize = word_edges.iter().map(|b| b.len()).sum();
+        eprintln!("  build_word_lattice n={n} edges={ne} {:.2}ms", _t0.elapsed().as_secs_f64()*1000.0);
+    }
 
-    // Precompute word matches starting at each position.
-    let mut matches_at: Vec<Vec<WordMatch>> = Vec::with_capacity(n);
-    for start in 0..n {
-        matches_at.push(engine.lexicon.match_from(lattice, start));
+    // Arena of DP nodes. Node 0 is the origin (empty prefix at pos 0).
+    let mut arena: Vec<VNode> = Vec::with_capacity(n * cfg.beam_width.max(1));
+    arena.push(VNode { score: 0, word_id: u32::MAX, edge: u32::MAX, prev: usize::MAX });
+
+    // frontier[pos] = arena node indices whose consumed input ends exactly at letter `pos`.
+    let mut frontier: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
+    frontier[0].push(0);
+    // We need a stable view of word edges by global index for reconstruction.
+    // Flatten edges into one vector with absolute indices, indexed per start.
+    let mut flat: Vec<WordEdge> = Vec::new();
+    let mut edge_start: Vec<(usize, usize)> = vec![(0, 0); n]; // (offset, len) into flat
+    for (s, bucket) in word_edges.iter().enumerate() {
+        edge_start[s] = (flat.len(), bucket.len());
+        flat.extend_from_slice(bucket);
     }
 
     for pos in 0..n {
-        if beams[pos].is_empty() {
+        if frontier[pos].is_empty() {
             continue;
         }
-        // prune this beam frontier
-        prune(&mut beams[pos], cfg.beam_width);
-        let frontier = beams[pos].clone();
+        // Beam-prune the frontier at this position (cheapest first).
+        beam_prune(&mut frontier[pos], &arena, cfg.beam_width);
+        let frontier_pos = frontier[pos].clone();
 
-        for wm in &matches_at[pos] {
-            // choose the best (cheapest) word from this reading's postings; also expand a few.
-            let mut words = wm.words.clone();
-            words.sort_by_key(|(_, c)| *c);
-            let take = words.len().min(4);
-            for &(word_id, reading_cost) in &words[..take] {
-                let surface = match engine.lexicon.surface(word_id) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                for prev in &frontier {
-                    let trans = engine.lm.transition_cost(prev.last_word_id, word_id) as i32;
-                    let add = reading_cost as i32 + wm.edit_cost + trans;
-                    let new_score = prev.score + add;
-                    let mut segs = prev.segments.clone();
-                    let span_start = byte_start + norm.orig_byte[wm.start];
-                    let span_end = byte_start + norm.orig_end[wm.end - 1];
-                    // reconstruct reading text from the lattice path is non-trivial; store the
-                    // consumed input slice as reading approximation.
-                    let reading: String =
-                        norm.letters[wm.start..wm.end].to_string();
-                    segs.push(Segment {
-                        text: surface.clone(),
-                        reading,
-                        input_span: (span_start, span_end),
-                    });
-                    let cand = Partial {
-                        text: format!("{}{}", prev.text, surface),
-                        score: new_score,
-                        segments: segs,
-                        last_word_id: Some(word_id),
-                        first_word_id: prev.first_word_id.or(Some(word_id)),
-                        kind: CandidateKind::Chinese,
-                    };
-                    beams[wm.end].push(cand);
-                }
+        let (off, len) = edge_start[pos];
+        for ei in off..off + len {
+            let we = &flat[ei];
+            for &prev_idx in &frontier_pos {
+                let prev = arena[prev_idx];
+                let prev_word = if prev.word_id == u32::MAX { None } else { Some(prev.word_id) };
+                let trans = engine.lm.transition_cost(prev_word, we.word_id) as i32;
+                let new_score = prev.score + we.cost + trans;
+                let node_idx = arena.len();
+                arena.push(VNode {
+                    score: new_score,
+                    word_id: we.word_id,
+                    edge: ei as u32,
+                    prev: prev_idx,
+                });
+                frontier[we.end].push(node_idx);
             }
         }
     }
 
-    // Collect full-coverage results (or prefix results in predict mode).
-    let mut out = Vec::new();
+    // Reconstruct candidate Partials from terminal nodes (full coverage, or any prefix in predict).
+    let mut out: Vec<Partial> = Vec::new();
+    let reconstruct = |mut idx: usize, extra: i32| -> Option<Partial> {
+        let mut node = arena[idx];
+        if node.prev == usize::MAX {
+            return None; // origin only, no words consumed
+        }
+        let final_score = node.score + extra;
+        let last_word_id = Some(node.word_id);
+        let mut segs: Vec<Segment> = Vec::new();
+        let mut text = String::new();
+        let mut first_word_id = None;
+        // Walk backpointers, collecting edges (reverse order).
+        let mut chain: Vec<u32> = Vec::new();
+        loop {
+            if node.edge == u32::MAX {
+                break;
+            }
+            chain.push(node.edge);
+            first_word_id = Some(node.word_id);
+            idx = node.prev;
+            node = arena[idx];
+        }
+        chain.reverse();
+        for &ei in &chain {
+            let we = &flat[ei as usize];
+            let surface = engine.lexicon.surface(we.word_id).unwrap_or_default();
+            let span_start = byte_start + norm.orig_byte[we.start];
+            let span_end = byte_start + norm.orig_end[we.end - 1];
+            let reading = norm.letters[we.start..we.end].to_string();
+            text.push_str(&surface);
+            segs.push(Segment { text: surface, reading, input_span: (span_start, span_end) });
+        }
+        Some(Partial {
+            text,
+            score: final_score,
+            segments: segs,
+            last_word_id,
+            first_word_id,
+            kind: CandidateKind::Chinese,
+        })
+    };
+
     if predict {
-        // any partial that has consumed at least one syllable is a completion candidate;
-        // prefer longer coverage with a mild bonus.
         for pos in 1..=n {
-            for p in &beams[pos] {
-                if p.segments.is_empty() {
-                    continue;
+            let coverage_bonus = (n - pos) as i32 * 100; // penalize leaving input uncovered
+            for &idx in &frontier[pos] {
+                if let Some(p) = reconstruct(idx, coverage_bonus) {
+                    out.push(p);
                 }
-                let coverage_bonus = (n - pos) as i32 * 100; // penalize leaving input uncovered
-                let mut q = p.clone();
-                q.score += coverage_bonus;
-                out.push(q);
             }
         }
     } else {
-        out.extend(beams[n].iter().cloned());
+        for &idx in &frontier[n] {
+            if let Some(p) = reconstruct(idx, 0) {
+                out.push(p);
+            }
+        }
     }
     out
 }
 
-fn prune(beam: &mut Vec<Partial>, width: usize) {
-    if beam.len() <= width {
+/// Beam-prune a frontier of arena node indices to `width`, keeping the cheapest. Also dedups by
+/// `last_word_id` keeping the best per language-model history (so the beam carries diverse states
+/// rather than `width` copies of the same word).
+fn beam_prune(frontier: &mut Vec<usize>, arena: &[VNode], width: usize) {
+    if frontier.len() > 1 {
+        // keep cheapest per last_word_id
+        let mut best: FxHashMap<u32, usize> = FxHashMap::default();
+        for &idx in frontier.iter() {
+            let wid = arena[idx].word_id;
+            match best.get(&wid) {
+                Some(&j) if arena[j].score <= arena[idx].score => {}
+                _ => {
+                    best.insert(wid, idx);
+                }
+            }
+        }
+        frontier.clear();
+        frontier.extend(best.into_values());
+    }
+    if frontier.len() <= width {
+        frontier.sort_unstable_by_key(|&i| arena[i].score);
         return;
     }
-    beam.sort_by_key(|p| p.score);
-    beam.truncate(width);
+    frontier.sort_unstable_by_key(|&i| arena[i].score);
+    frontier.truncate(width);
 }
 
 fn dedup_best(list: &mut Vec<Partial>) {

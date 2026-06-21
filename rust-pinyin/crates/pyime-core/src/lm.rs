@@ -12,7 +12,7 @@ use std::path::Path;
 
 /// Backoff penalty (in LOG_BASE cost units) added when a bigram is absent. Roughly a moderately
 /// unlikely transition; the unigram cost of the target word still dominates ranking.
-pub const BIGRAM_BACKOFF: u32 = 5000;
+pub const BIGRAM_BACKOFF: u32 = 2400;
 
 pub struct LanguageModel {
     _mmap: Mmap,
