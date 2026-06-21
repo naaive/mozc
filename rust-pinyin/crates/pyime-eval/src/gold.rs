@@ -255,7 +255,7 @@ pub fn generate(
     }
 
     let mut cases: Vec<GoldCase> = Vec::new();
-    let mut push = |bucket: &str, input: String, expected: String, cases: &mut Vec<GoldCase>| {
+    let push = |bucket: &str, input: String, expected: String, cases: &mut Vec<GoldCase>| {
         if input.is_empty() || expected.is_empty() {
             return;
         }
