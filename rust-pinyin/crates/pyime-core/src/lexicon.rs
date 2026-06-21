@@ -373,3 +373,45 @@ fn mmap(path: &Path) -> anyhow::Result<Mmap> {
         .map_err(|e| anyhow::anyhow!("mmap {}: {e}", path.display()))?;
     Ok(m)
 }
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::path::Path;
+    #[test]
+    fn probe_keys() {
+        let dir = Path::new("../../data");
+        if !dir.join("lexicon.fst").exists() { return; }
+        let lex = Lexicon::load(dir).unwrap();
+        for key in ["shou'bu'le","shou'bu'liao","yu'gang'hen'qian","hou'lai'fa'xian","he'he","shou'bu","shou'bu'le'search"] {
+            match lex.lookup_exact(key) {
+                Some(v) => {
+                    let s: Vec<String> = v.iter().take(5).map(|(id,c)| format!("{}({})", lex.surface(*id).unwrap_or_default(), c)).collect();
+                    println!("PROBE {:>20} -> {:?}", key, s);
+                }
+                None => println!("PROBE {:>20} -> NONE", key),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests2 {
+    use super::*;
+    use std::path::Path;
+    #[test]
+    fn probe_keys2() {
+        let dir = Path::new("../../data");
+        if !dir.join("lexicon.fst").exists() { return; }
+        let lex = Lexicon::load(dir).unwrap();
+        for key in ["le","liao","shou","bu","bu'le","shou'bu'le","yu'gang","hen'qian","hen'qian'qian","yu","gang","hen","qian"] {
+            match lex.lookup_exact(key) {
+                Some(v) => {
+                    let s: Vec<String> = v.iter().take(6).map(|(id,c)| format!("{}({})", lex.surface(*id).unwrap_or_default(), c)).collect();
+                    println!("PB2 {:>16} -> {:?}", key, s);
+                }
+                None => println!("PB2 {:>16} -> NONE", key),
+            }
+        }
+    }
+}
