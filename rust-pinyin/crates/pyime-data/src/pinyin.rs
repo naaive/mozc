@@ -160,6 +160,60 @@ pub fn word_to_key(
     Some(sylls.join("'"))
 }
 
+/// Normalize a space-separated rime-ice pinyin reading (e.g. `zhong guo`,
+/// `ni hao`) into the canonical key with syllables joined by `'` (e.g.
+/// `zhong'guo`). Returns None if no usable syllable survives. Each syllable is
+/// passed through [`normalize_syllable`] (tone-less, ü/v→`v`, lowercase).
+pub fn normalize_reading(py: &str) -> Option<String> {
+    let sylls: Vec<String> = py
+        .split_whitespace()
+        .map(normalize_syllable)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sylls.is_empty() {
+        None
+    } else {
+        Some(sylls.join("'"))
+    }
+}
+
+/// Parse a rime-ice single-character dict (e.g. `8105.dict.yaml`,
+/// `41448.dict.yaml`) into a char→canonical-reading table. Lines are
+/// `char<TAB>pinyin[<TAB>weight]`; only single-CJK-char entries are kept, and
+/// the FIRST reading seen for a char wins (files are weight-sorted, so this is
+/// the most common reading). Comment/`---`/`...`/header lines are skipped.
+pub fn parse_rime_char_table(raw: &[u8]) -> Result<HanziTable> {
+    let text = std::str::from_utf8(raw).context("rime char table utf8")?;
+    let mut map: HanziTable = FxHashMap::default();
+    for line in text.lines() {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() || line.starts_with('#') || line.starts_with("---") || line == "..." {
+            continue;
+        }
+        let mut it = line.split('\t');
+        let word = match it.next() {
+            Some(w) => w.trim(),
+            None => continue,
+        };
+        // single CJK char only
+        let mut chs = word.chars();
+        let ch = match (chs.next(), chs.next()) {
+            (Some(c), None) if is_cjk(c) => c,
+            _ => continue,
+        };
+        let py = match it.next() {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        // a single-char reading should be one syllable
+        let syl = normalize_syllable(py.split_whitespace().next().unwrap_or(""));
+        if !syl.is_empty() {
+            map.entry(ch).or_insert(syl);
+        }
+    }
+    Ok(map)
+}
+
 /// Coarse part-of-speech tag → small u8 code (0 = generic). Just a few buckets.
 pub fn pos_tag(pos: &str) -> u8 {
     match pos.chars().next() {

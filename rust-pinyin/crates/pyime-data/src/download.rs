@@ -63,7 +63,43 @@ fn download_with_retries(url: &str) -> Result<Vec<u8>> {
             }
         }
     }
+    // Fallback: some sandboxes ship a `ureq` rustls root store that rejects the
+    // GitHub cert chain ("UnknownIssuer") even though the system `curl` trusts it.
+    // Try the system curl/wget as a last resort so the build stays self-sufficient.
+    match download_via_cli(url) {
+        Ok(b) if !b.is_empty() => {
+            eprintln!("  recovered via system curl/wget: {url}");
+            return Ok(b);
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("  curl/wget fallback failed: {e:#}"),
+    }
     Err(last_err.unwrap_or_else(|| anyhow!("download failed: {url}")))
+}
+
+/// Download `url` to stdout via the system `curl` (then `wget`) binary. Used only
+/// as a TLS-trust fallback when the in-process `ureq` client fails.
+fn download_via_cli(url: &str) -> Result<Vec<u8>> {
+    use std::process::Command;
+    // Try curl first.
+    if let Ok(out) = Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "--max-time", "180", url])
+        .output()
+    {
+        if out.status.success() && !out.stdout.is_empty() {
+            return Ok(out.stdout);
+        }
+    }
+    // Then wget.
+    if let Ok(out) = Command::new("wget")
+        .args(["-q", "-O", "-", "--timeout=180", url])
+        .output()
+    {
+        if out.status.success() && !out.stdout.is_empty() {
+            return Ok(out.stdout);
+        }
+    }
+    Err(anyhow!("no working curl/wget for {url}"))
 }
 
 fn download_once(url: &str) -> Result<Vec<u8>> {

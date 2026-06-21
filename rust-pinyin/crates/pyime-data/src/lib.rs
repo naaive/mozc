@@ -1,11 +1,17 @@
-//! pyime-data — data build pipeline.
+//! pyime-data — data build pipeline (v3, commercial-grade overhaul).
 //!
 //! Downloads freely-available Chinese pinyin dictionary + corpus data and emits the
-//! `data/` artifacts consumed by the engine, EXACTLY matching the DESIGN.md
-//! "Data format contract (v1)":
+//! `data/` artifacts consumed by the engine, matching the DESIGN.md format contract
+//! (v1 on-disk layout + v2 additions):
 //!   meta.json, words.bin (rkyv Vec<WordEntry>), lexicon.fst, postings.bin,
-//!   bigram.fst, english.fst, plus helper files hanzi_pinyin.tsv and
-//!   heldout_sentences.txt.
+//!   bigram.fst, trigram.fst, english.fst, plus helper files hanzi_pinyin.tsv,
+//!   word_pinyin.tsv and corpus/heldout_sentences.txt.
+//!
+//! KEY CHANGE (v3): the lexicon is built PRIMARILY from the hand-curated
+//! `iDvel/rime-ice` dictionaries (correct polyphone readings + good weights),
+//! supplemented by `rime/rime-essay` and rime-ice `tencent` frequencies, and only
+//! then back-filled from jieba for coverage. This fixes mangled polyphone readings
+//! (了 le/liao, 行 xing/hang, ...) that the old per-char composition produced.
 //!
 //! Public entry points:
 //!   - [`build_all`]  — download (with caching) + build everything.
@@ -42,31 +48,48 @@ pub fn prob_to_cost(prob: f64) -> u16 {
     }
 }
 
+/// u64 variant of [`prob_to_cost`] for LM (bigram/trigram) costs.
+#[inline]
+fn prob_to_cost_u64(prob: f64) -> u64 {
+    if prob <= 0.0 {
+        return COST_MAX as u64;
+    }
+    let c = (-LOG_BASE * prob.ln()).round();
+    if c <= 0.0 {
+        0
+    } else if c >= COST_MAX as f64 {
+        COST_MAX as u64
+    } else {
+        c as u64
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tuning / pruning knobs (kept well under the size budget).
 // ---------------------------------------------------------------------------
 
-/// Keep at most this many dictionary words (after CJK filtering). The jieba dict
-/// has ~350k entries; after pruning non-CJK it is far fewer, so this is a safety cap.
-const MAX_WORDS: usize = 600_000;
+/// Keep at most this many dictionary words. rime-ice base has ~400k+ entries; with
+/// jieba back-fill this is a safety cap (we keep the highest-frequency words).
+const MAX_WORDS: usize = 700_000;
 /// Cap on English vocabulary size (frequency-ranked first).
 const MAX_ENGLISH: usize = 60_000;
-/// Drop word-bigram pairs observed fewer than this many (weighted) times. With the
-/// large general-domain news corpus, low-count pairs are mostly noise that displaces
-/// good candidates from the N-best list; a higher threshold keeps only robust pairs
-/// and was found (vs the gold eval) to maximize top5/coverage. Counts are weighted
-/// (see SHOPPING_WEIGHT), so in-domain pairs clear the bar with far fewer raw hits.
-const BIGRAM_MIN_COUNT: u32 = 12;
-/// Hard cap on the number of bigram pairs kept (highest-count first), to bound
-/// `bigram.fst` size under the data budget.
+/// Drop word-bigram pairs observed fewer than this many times. With multiple
+/// large corpora, low-count pairs are mostly noise that displaces good candidates.
+const BIGRAM_MIN_COUNT: u32 = 5;
+/// Drop word-trigram triples observed fewer than this many times.
+const TRIGRAM_MIN_COUNT: u32 = 4;
+/// Hard cap on the number of bigram pairs kept (highest-count first).
 const MAX_BIGRAMS: usize = 2_500_000;
+/// Hard cap on the number of trigram triples kept (highest-count first).
+const MAX_TRIGRAMS: usize = 3_000_000;
 /// Weight (count multiplier) applied to the in-domain shopping corpus when training
-/// the bigram LM. The general corpus is ~6x larger; weighting shopping keeps the
-/// in-domain (EVAL gold) signal from being swamped while the general corpus still
-/// supplies common-phrase coverage.
+/// the LM (the general corpus is much larger; this keeps the in-domain signal alive).
 const SHOPPING_WEIGHT: u32 = 6;
 /// Number of held-out sentences to reserve for the EVAL agent.
 const HELDOUT_SENTENCES: usize = 4_000;
+
+/// Default rime weight when an entry omits one.
+const DEFAULT_RIME_WEIGHT: u64 = 1;
 
 /// Build everything: download sources into `corpus_dir` (cache) and write artifacts
 /// into `out_dir`. `offline` skips network and requires the cache to be populated.
@@ -81,11 +104,27 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
     let mut notes: Vec<String> = Vec::new();
 
     // --- 1. Download sources (cached) ---------------------------------------
-    eprintln!("[1/7] fetching sources (offline={offline}) ...");
+    eprintln!("[1/8] fetching sources (offline={offline}) ...");
     let read_cached = |name: &str, url: &str| -> Result<Vec<u8>> {
         let p = fetch_to_cache(corpus_dir, name, url, offline)?;
         std::fs::read(&p).with_context(|| format!("read cached {}", p.display()))
     };
+    // best-effort fetch: returns empty Vec (and logs) instead of failing the build.
+    let try_cached = |name: &str, url: &str, notes: &mut Vec<String>, tag: &str| -> Vec<u8> {
+        match read_cached(name, url) {
+            Ok(b) => {
+                notes.push(format!("{tag}=ok"));
+                b
+            }
+            Err(e) => {
+                eprintln!("  WARN {tag} unavailable: {e:#}");
+                notes.push(format!("{tag}=UNAVAILABLE"));
+                Vec::new()
+            }
+        }
+    };
+
+    // mozillazg single-char + phrase pinyin (fallback reading sources for coverage).
     let hanzi_raw = read_cached(
         "pinyin-data.txt",
         "https://raw.githubusercontent.com/mozillazg/pinyin-data/master/pinyin.txt",
@@ -98,12 +137,51 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
         "jieba-dict.txt",
         "https://raw.githubusercontent.com/fxsjy/jieba/master/jieba/dict.txt",
     )?;
+
+    // rime-ice curated dictionaries (PRIMARY reading + weight source).
+    let rime_base_raw = try_cached(
+        "rime-ice-base.dict.yaml",
+        "https://raw.githubusercontent.com/iDvel/rime-ice/main/cn_dicts/base.dict.yaml",
+        &mut notes,
+        "rime-ice-base",
+    );
+    let rime_8105_raw = try_cached(
+        "rime-ice-8105.dict.yaml",
+        "https://raw.githubusercontent.com/iDvel/rime-ice/main/cn_dicts/8105.dict.yaml",
+        &mut notes,
+        "rime-ice-8105",
+    );
+    let rime_41448_raw = try_cached(
+        "rime-ice-41448.dict.yaml",
+        "https://raw.githubusercontent.com/iDvel/rime-ice/main/cn_dicts/41448.dict.yaml",
+        &mut notes,
+        "rime-ice-41448",
+    );
+    let rime_others_raw = try_cached(
+        "rime-ice-others.dict.yaml",
+        "https://raw.githubusercontent.com/iDvel/rime-ice/main/cn_dicts/others.dict.yaml",
+        &mut notes,
+        "rime-ice-others",
+    );
+    // tencent: word<TAB>weight (NO pinyin) — frequency supplement only.
+    let rime_tencent_raw = try_cached(
+        "rime-ice-tencent.dict.yaml",
+        "https://raw.githubusercontent.com/iDvel/rime-ice/main/cn_dicts/tencent.dict.yaml",
+        &mut notes,
+        "rime-ice-tencent",
+    );
+    // rime-essay: word<TAB>freq — frequency supplement only.
+    let essay_raw = try_cached(
+        "rime-essay.txt",
+        "https://raw.githubusercontent.com/rime/rime-essay/master/essay.txt",
+        &mut notes,
+        "rime-essay",
+    );
+
     let english_raw = read_cached(
         "english-words.txt",
         "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt",
     )?;
-    // Frequency-ranked common-English list (google-10000-english). Used to make sure
-    // common everyday words — including longer ones — survive the english.fst cap.
     let english_freq_raw = match read_cached(
         "google-10000-english.txt",
         "https://raw.githubusercontent.com/first20hours/google-10000-english/master/google-10000-english.txt",
@@ -115,14 +193,7 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
         }
     };
 
-    // --- Sentence corpora (for bigram LM + held-out eval) --------------------
-    // We UNION a large general-domain corpus (Toutiao news headlines) with the
-    // existing shopping-review corpus so general phrases (我是, 我们, 今天, ...)
-    // get proper weight while shopping coverage is preserved. Both are best-effort;
-    // if everything is unreachable we fall back to dictionary phrases.
-
-    // (a) General-domain: Toutiao news-headline dataset (~382k titles + keywords).
-    //     Single .txt inside a .zip on raw.githubusercontent.com.
+    // --- Sentence corpora (for bigram/trigram LM + held-out eval) ------------
     let corpus_toutiao = match fetch_to_cache(
         corpus_dir,
         "toutiao_cat_data.txt",
@@ -139,13 +210,9 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
             None
         }
     };
-
-    // (b) Domain: online shopping reviews (preserve original coverage).
     let corpus_csv = match fetch_to_cache(
         corpus_dir,
         "online_shopping_10_cats.csv",
-        // The repo ships a zip; we cache the *extracted* csv. download.rs handles
-        // ".csv from .zip" by extension heuristics below.
         "https://raw.githubusercontent.com/SophonPlus/ChineseNlpCorpus/master/datasets/online_shopping_10_cats/online_shopping_10_cats.zip",
         offline,
     ) {
@@ -160,50 +227,101 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
         }
     };
 
-    // --- 2. Parse hanzi + phrase pinyin tables ------------------------------
-    eprintln!("[2/7] parsing pinyin tables ...");
-    let hanzi: pinyin::HanziTable = pinyin::parse_hanzi_table(&hanzi_raw)?;
-    eprintln!("  hanzi first-readings: {}", hanzi.len());
+    // --- 2. Build the hanzi (single-char) reading table ---------------------
+    // Prefer rime-ice 8105/41448 single-char readings (correct), back-fill with
+    // mozillazg pinyin-data for any char they miss.
+    eprintln!("[2/8] building hanzi reading table ...");
+    let mut hanzi: pinyin::HanziTable = pinyin::parse_hanzi_table(&hanzi_raw)?;
+    let moz_chars = hanzi.len();
+    let mut rime_char_count = 0usize;
+    // Priority order for the per-char COMPOSITION reading (used to back-fill jieba
+    // words): 8105 is weight-sorted and authoritative → it OVERRIDES mozillazg.
+    // 41448 (weight-less, broader) only fills chars 8105 lacks.
+    if !rime_8105_raw.is_empty() {
+        for (c, py) in pinyin::parse_rime_char_table(&rime_8105_raw)? {
+            hanzi.insert(c, py); // 8105 wins
+            rime_char_count += 1;
+        }
+    }
+    if !rime_41448_raw.is_empty() {
+        for (c, py) in pinyin::parse_rime_char_table(&rime_41448_raw)? {
+            hanzi.entry(c).or_insert(py); // only fill missing
+            rime_char_count += 1;
+        }
+    }
+    eprintln!(
+        "  hanzi readings: {} (mozillazg {} + rime-ice single-char {} merged)",
+        hanzi.len(),
+        moz_chars,
+        rime_char_count
+    );
     let phrases = pinyin::parse_phrase_table(&phrase_raw)?;
     eprintln!("  phrase overrides: {}", phrases.len());
 
-    // helper file: data/hanzi_pinyin.tsv
+    // helper file: data/hanzi_pinyin.tsv (now rime-ice-corrected single-char readings)
     write_hanzi_tsv(out_dir, &hanzi).context("write hanzi_pinyin.tsv")?;
 
-    // --- 3. Build word list from jieba dict ---------------------------------
-    eprintln!("[3/7] building word list ...");
-    let words = build_words(&jieba_raw, &hanzi, &phrases)?;
-    eprintln!("  words kept: {}  readings: {}", words.entries.len(), words.readings.len());
+    // --- 3. Build word list (rime-ice PRIMARY, jieba back-fill) -------------
+    eprintln!("[3/8] building lexicon (rime-ice primary) ...");
+    // rime-ice reading-bearing word sources, in priority order. base (multi-char,
+    // weighted), 8105 (single-char, weighted, all polyphone readings), 41448
+    // (single-char, broader coverage, weight 1), others (容错/口语 readings).
+    let rime_word_sources: [&[u8]; 4] = [
+        &rime_base_raw,
+        &rime_8105_raw,
+        &rime_41448_raw,
+        &rime_others_raw,
+    ];
+    let words = build_words(
+        &rime_word_sources,
+        &rime_tencent_raw,
+        &essay_raw,
+        &jieba_raw,
+        &hanzi,
+        &phrases,
+        &mut notes,
+    )?;
+    eprintln!(
+        "  words kept: {}  readings: {}",
+        words.entries.len(),
+        words.readings.len()
+    );
 
     // --- 4. Emit words.bin + lexicon.fst + postings.bin ---------------------
-    eprintln!("[4/7] writing words.bin / lexicon.fst / postings.bin ...");
+    eprintln!("[4/8] writing words.bin / lexicon.fst / postings.bin ...");
     let num_readings = write_lexicon(out_dir, &words)?;
 
-    // --- 5. Build + emit bigram.fst -----------------------------------------
-    eprintln!("[5/7] building bigram LM ...");
-    let (num_bigrams, heldout) = build_and_write_bigram(
+    // helper file: data/word_pinyin.tsv — every word + canonical reading.
+    write_word_pinyin_tsv(out_dir, &words).context("write word_pinyin.tsv")?;
+
+    // --- 5. Build + emit bigram.fst + trigram.fst ---------------------------
+    eprintln!("[5/8] building bigram + trigram LM ...");
+    let (num_bigrams, num_trigrams, heldout) = build_and_write_ngrams(
         out_dir,
-        corpus_dir,
         &words,
         corpus_toutiao.as_deref(),
         corpus_csv.as_deref(),
     )?;
-    eprintln!("  bigrams kept: {num_bigrams}  heldout sentences: {}", heldout.len());
+    eprintln!(
+        "  bigrams kept: {num_bigrams}  trigrams kept: {num_trigrams}  heldout: {}",
+        heldout.len()
+    );
 
     // helper file: corpus/heldout_sentences.txt
     write_heldout(corpus_dir, &heldout, &words, &mut notes)?;
 
     // --- 6. Emit english.fst ------------------------------------------------
-    eprintln!("[6/7] writing english.fst ...");
+    eprintln!("[6/8] writing english.fst ...");
     let num_english = write_english(out_dir, &english_raw, &english_freq_raw)?;
     eprintln!("  english terms: {num_english}");
 
     // --- 7. meta.json -------------------------------------------------------
-    eprintln!("[7/7] writing meta.json ...");
+    eprintln!("[7/8] writing meta.json ...");
     notes.push(format!("english={num_english}"));
     let source_notes = format!(
-        "jieba-dict + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words \
-         + google-10000-english + toutiao-news-titles; {}",
+        "rime-ice(base/8105/41448/others/tencent) + rime-essay + jieba-dict back-fill \
+         + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words \
+         + google-10000-english + toutiao-news-titles + online-shopping; {}",
         notes.join(", ")
     );
     write_meta(
@@ -211,15 +329,17 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
         words.entries.len() as u64,
         num_readings,
         num_bigrams,
+        num_trigrams,
         &source_notes,
     )?;
 
-    eprintln!("done. data dir: {}", out_dir.display());
+    // --- 8. done ------------------------------------------------------------
+    eprintln!("[8/8] done. data dir: {}", out_dir.display());
     Ok(())
 }
 
 // ===========================================================================
-// Word list construction
+// Word list construction (rime-ice primary)
 // ===========================================================================
 
 /// One reading bucket -> list of (word_id, reading-specific cost).
@@ -228,28 +348,184 @@ struct WordSet {
     entries: Vec<pyime_core::format::WordEntry>,
     /// reading key (e.g. "ni'hao") -> Vec<(word_id, cost)>
     readings: FxHashMap<String, Vec<(u32, u16)>>,
-    /// surface -> id, for bigram counting
+    /// surface -> id, for n-gram counting (most-frequent id per surface).
     surface_to_id: FxHashMap<String, u32>,
+    /// id -> canonical reading key, for word_pinyin.tsv export.
+    id_reading: Vec<String>,
 }
 
+/// Internal merged word record before id assignment.
+struct WordRec {
+    surface: String,
+    reading: String,
+    freq: f64,
+    pos: u8,
+}
+
+/// Parse rime-ice `word<TAB>pinyin[<TAB>weight]` entries, skipping comments and
+/// the YAML header (everything up to and incl. the `...` line, plus `#`/`---`).
+/// Calls `f(word, reading_key, weight)` for each valid multi-or-single-char entry.
+fn for_each_rime_word_entry(raw: &[u8], mut f: impl FnMut(&str, String, u64)) {
+    let text = match std::str::from_utf8(raw) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() || line.starts_with('#') || line.starts_with("---") || line == "..." {
+            continue;
+        }
+        let mut it = line.split('\t');
+        let word = match it.next() {
+            Some(w) => w.trim(),
+            None => continue,
+        };
+        if word.is_empty() || !pinyin::is_all_cjk(word) {
+            continue;
+        }
+        let py = match it.next() {
+            Some(p) => p.trim(),
+            None => continue, // no pinyin field (e.g. tencent) — skip here
+        };
+        let reading = match pinyin::normalize_reading(py) {
+            Some(r) => r,
+            None => continue,
+        };
+        // syllable count should match char count for a sane alignment.
+        let nsyl = reading.split('\'').count();
+        if nsyl != word.chars().count() {
+            continue;
+        }
+        let weight: u64 = it
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(DEFAULT_RIME_WEIGHT);
+        f(word, reading, weight.max(1));
+    }
+}
+
+/// Parse a `word<TAB>weight` frequency-only file (rime-ice tencent, rime-essay),
+/// calling `f(word, weight)` for each CJK-only entry.
+fn for_each_freq_entry(raw: &[u8], mut f: impl FnMut(&str, u64)) {
+    let text = match std::str::from_utf8(raw) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() || line.starts_with('#') || line.starts_with("---") || line == "..." {
+            continue;
+        }
+        let mut it = line.split('\t');
+        let word = match it.next() {
+            Some(w) => w.trim(),
+            None => continue,
+        };
+        if word.is_empty() || !pinyin::is_all_cjk(word) {
+            continue;
+        }
+        let weight: u64 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(1);
+        f(word, weight.max(1));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_words(
+    rime_word_sources: &[&[u8]],
+    rime_tencent_raw: &[u8],
+    essay_raw: &[u8],
     jieba_raw: &[u8],
     hanzi: &pinyin::HanziTable,
     phrases: &FxHashMap<String, Vec<String>>,
+    notes: &mut Vec<String>,
 ) -> Result<WordSet> {
-    let text = std::str::from_utf8(jieba_raw).context("jieba dict utf8")?;
+    // Merged store keyed by (surface, reading) → (freq, pos).
+    // rime-ice readings are authoritative; freqs are merged additively across
+    // rime-ice base, others, tencent (freq-only), essay (freq-only).
+    let mut merged: FxHashMap<(String, String), (f64, u8)> = FxHashMap::default();
+    // Track which surfaces already have a rime-ice reading (so jieba only back-fills).
+    let mut rime_surfaces: FxHashMap<String, ()> = FxHashMap::default();
+    // For freq-only sources, we need a reading to attach the freq to: use the
+    // best (highest-freq) rime reading for that surface seen so far.
+    let mut best_reading_for_surface: FxHashMap<String, (String, f64)> = FxHashMap::default();
 
-    // First pass: collect (surface, freq) for valid CJK words.
-    struct Raw {
-        surface: String,
-        freq: u64,
-        pos: u8,
-        key: String,
+    let mut rime_word_lines = 0u64;
+    let insert_reading = |merged: &mut FxHashMap<(String, String), (f64, u8)>,
+                          rime_surfaces: &mut FxHashMap<String, ()>,
+                          best: &mut FxHashMap<String, (String, f64)>,
+                          surface: &str,
+                          reading: String,
+                          freq: f64| {
+        rime_surfaces.entry(surface.to_string()).or_insert(());
+        let e = merged
+            .entry((surface.to_string(), reading.clone()))
+            .or_insert((0.0, 0));
+        e.0 += freq;
+        let total = e.0;
+        match best.get_mut(surface) {
+            Some(b) if b.1 < total => {
+                b.0 = reading;
+                b.1 = total;
+            }
+            Some(_) => {}
+            None => {
+                best.insert(surface.to_string(), (reading, total));
+            }
+        }
+    };
+
+    // (a) rime-ice reading-bearing sources (base + 8105 + 41448 + others) — the
+    //     curated readings & weights, incl. ALL single-char polyphone readings.
+    for raw in rime_word_sources {
+        for_each_rime_word_entry(raw, |word, reading, weight| {
+            rime_word_lines += 1;
+            insert_reading(
+                &mut merged,
+                &mut rime_surfaces,
+                &mut best_reading_for_surface,
+                word,
+                reading,
+                weight as f64,
+            );
+        });
     }
-    let mut raws: Vec<Raw> = Vec::new();
-    let mut total_freq: u64 = 0;
+    eprintln!("  rime-ice reading entries: {rime_word_lines}");
 
-    for line in text.lines() {
+    // (b) freq-only supplements: rime-ice tencent + rime-essay. Attach freq to the
+    //     surface's best rime reading if known; otherwise compose a reading from the
+    //     (rime-corrected) hanzi table so the word still gets a usable entry.
+    let mut freq_supp_applied = 0u64;
+    let mut freq_supp_composed = 0u64;
+    let mut apply_freq = |surface: &str, weight: u64| {
+        if let Some((reading, _)) = best_reading_for_surface.get(surface).cloned() {
+            let e = merged
+                .entry((surface.to_string(), reading))
+                .or_insert((0.0, 0));
+            e.0 += weight as f64;
+            freq_supp_applied += 1;
+        } else if let Some(reading) = pinyin::word_to_key(surface, hanzi, phrases) {
+            // compose a reading (correctness still benefits from rime-corrected hanzi)
+            let e = merged
+                .entry((surface.to_string(), reading))
+                .or_insert((0.0, 0));
+            e.0 += weight as f64;
+            freq_supp_composed += 1;
+        }
+    };
+    for_each_freq_entry(rime_tencent_raw, |w, wt| apply_freq(w, wt));
+    for_each_freq_entry(essay_raw, |w, wt| apply_freq(w, wt));
+    eprintln!(
+        "  freq-supplement entries applied: {freq_supp_applied} (composed-reading: {freq_supp_composed})"
+    );
+
+    // (c) jieba back-fill: ONLY for surfaces NOT already present from rime-ice.
+    //     Compose readings from the (rime-corrected) hanzi/phrase table.
+    let jieba_text = std::str::from_utf8(jieba_raw).context("jieba dict utf8")?;
+    // jieba freqs are large counts; rescale to be comparable to rime weights. We keep
+    // them as-is (additive into a separate, lower-magnitude pool) — they only matter
+    // for words rime doesn't have, so absolute scale vs rime is unimportant.
+    let mut jieba_added = 0u64;
+    for line in jieba_text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -261,41 +537,55 @@ fn build_words(
         };
         let freq: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let pos_str = it.next().unwrap_or("");
-
-        // Keep only words whose chars are all CJK (skip ascii / mixed / punctuation).
-        if !pinyin::is_all_cjk(surface) {
+        if freq == 0 || !pinyin::is_all_cjk(surface) {
             continue;
         }
-        let key = match pinyin::word_to_key(surface, hanzi, phrases) {
+        if rime_surfaces.contains_key(surface) {
+            continue; // rime-ice wins on conflict
+        }
+        let reading = match pinyin::word_to_key(surface, hanzi, phrases) {
             Some(k) => k,
-            None => continue, // every char lacked a reading
+            None => continue,
         };
-        if freq == 0 {
-            continue;
-        }
-        total_freq += freq;
-        raws.push(Raw {
-            surface: surface.to_string(),
+        let e = merged
+            .entry((surface.to_string(), reading))
+            .or_insert((0.0, 0));
+        e.0 += freq as f64;
+        e.1 = pinyin::pos_tag(pos_str);
+        jieba_added += 1;
+    }
+    eprintln!("  jieba back-fill (surfaces not in rime-ice): {jieba_added}");
+    notes.push(format!(
+        "lexicon: rime-words={rime_word_lines}, freq-supp={freq_supp_applied}, jieba-backfill={jieba_added}"
+    ));
+
+    // --- materialize: assign ids, compute unigram cost from merged freq ------
+    let mut recs: Vec<WordRec> = merged
+        .into_iter()
+        .map(|((surface, reading), (freq, pos))| WordRec {
+            surface,
+            reading,
             freq,
-            pos: pinyin::pos_tag(pos_str),
-            key,
-        });
+            pos,
+        })
+        .collect();
+
+    // Prune to top-N by frequency if necessary (keep most frequent).
+    if recs.len() > MAX_WORDS {
+        recs.sort_unstable_by(|a, b| b.freq.partial_cmp(&a.freq).unwrap_or(std::cmp::Ordering::Equal));
+        recs.truncate(MAX_WORDS);
     }
 
-    // Prune to top-N by frequency if needed.
-    if raws.len() > MAX_WORDS {
-        raws.sort_unstable_by(|a, b| b.freq.cmp(&a.freq));
-        raws.truncate(MAX_WORDS);
-    }
+    let total_freq: f64 = recs.iter().map(|r| r.freq).sum::<f64>().max(1.0);
 
-    let total_freq = total_freq.max(1) as f64;
-
-    let mut entries: Vec<pyime_core::format::WordEntry> = Vec::with_capacity(raws.len());
+    let mut entries: Vec<pyime_core::format::WordEntry> = Vec::with_capacity(recs.len());
     let mut readings: FxHashMap<String, Vec<(u32, u16)>> = FxHashMap::default();
     let mut surface_to_id: FxHashMap<String, u32> = FxHashMap::default();
+    let mut surface_best_freq: FxHashMap<String, f64> = FxHashMap::default();
+    let mut id_reading: Vec<String> = Vec::with_capacity(recs.len());
 
-    for r in &raws {
-        let prob = r.freq as f64 / total_freq;
+    for r in &recs {
+        let prob = r.freq / total_freq;
         let cost = prob_to_cost(prob);
         let id = entries.len() as u32;
         entries.push(pyime_core::format::WordEntry {
@@ -303,12 +593,19 @@ fn build_words(
             unigram_cost: cost,
             pos: r.pos,
         });
-        // surface_to_id: keep the most-frequent id for a surface (raws may have dups)
-        surface_to_id.entry(r.surface.clone()).or_insert(id);
-        readings.entry(r.key.clone()).or_default().push((id, cost));
+        id_reading.push(r.reading.clone());
+        // surface_to_id: keep the id of the most-frequent reading for a surface.
+        match surface_best_freq.get(&r.surface) {
+            Some(&f) if f >= r.freq => {}
+            _ => {
+                surface_best_freq.insert(r.surface.clone(), r.freq);
+                surface_to_id.insert(r.surface.clone(), id);
+            }
+        }
+        readings.entry(r.reading.clone()).or_default().push((id, cost));
     }
 
-    // Sort each posting list by cost ascending (best first) for nicer decoding.
+    // Sort each posting list by cost ascending (best first).
     for v in readings.values_mut() {
         v.sort_unstable_by_key(|&(_, c)| c);
     }
@@ -317,6 +614,7 @@ fn build_words(
         entries,
         readings,
         surface_to_id,
+        id_reading,
     })
 }
 
@@ -325,18 +623,16 @@ fn build_words(
 // ===========================================================================
 
 fn write_lexicon(out_dir: &Path, words: &WordSet) -> Result<u64> {
-    // words.bin — rkyv Vec<WordEntry>
     let bytes = rkyv::to_bytes::<_, 1_048_576>(&words.entries)
         .map_err(|e| anyhow::anyhow!("rkyv serialize words: {e}"))?;
     std::fs::write(out_dir.join("words.bin"), &bytes).context("write words.bin")?;
 
-    // postings.bin + lexicon.fst.
-    // fst::Map requires keys inserted in lexicographic order.
     let mut keys: Vec<&String> = words.readings.keys().collect();
     keys.sort_unstable();
 
     let mut postings: Vec<u8> = Vec::new();
-    let postings_file = std::fs::File::create(out_dir.join("lexicon.fst")).context("create lexicon.fst")?;
+    let postings_file =
+        std::fs::File::create(out_dir.join("lexicon.fst")).context("create lexicon.fst")?;
     let wtr = std::io::BufWriter::new(postings_file);
     let mut map_builder = fst::MapBuilder::new(wtr).context("fst MapBuilder")?;
 
@@ -359,62 +655,70 @@ fn write_lexicon(out_dir: &Path, words: &WordSet) -> Result<u64> {
     Ok(words.readings.len() as u64)
 }
 
+/// data/word_pinyin.tsv: `word<TAB>canonical_reading` for EVERY lexicon word.
+fn write_word_pinyin_tsv(out_dir: &Path, words: &WordSet) -> Result<()> {
+    let mut buf = String::with_capacity(words.entries.len() * 16);
+    for (id, e) in words.entries.iter().enumerate() {
+        buf.push_str(&e.surface);
+        buf.push('\t');
+        buf.push_str(&words.id_reading[id]);
+        buf.push('\n');
+    }
+    std::fs::write(out_dir.join("word_pinyin.tsv"), buf).context("write word_pinyin.tsv")?;
+    Ok(())
+}
+
 // ===========================================================================
-// bigram.fst
+// bigram.fst + trigram.fst
 // ===========================================================================
 
-fn build_and_write_bigram(
+fn build_and_write_ngrams(
     out_dir: &Path,
-    corpus_dir: &Path,
     words: &WordSet,
     corpus_toutiao: Option<&Path>,
     corpus_csv: Option<&Path>,
-) -> Result<(u64, Vec<String>)> {
-    // Build a max-munch segmenter trie keyed on surfaces present in the dict.
+) -> Result<(u64, u64, Vec<String>)> {
     let seg = Segmenter::new(&words.surface_to_id);
 
-    // counts: (prev_id, id) -> count, and unigram counts for normalization.
-    let mut bi_counts: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     let mut uni_counts: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut bi_counts: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+    let mut tri_counts: FxHashMap<(u32, u32, u32), u32> = FxHashMap::default();
     let mut heldout: Vec<String> = Vec::new();
 
-    let count_sentence = |s: &str,
-                          weight: u32,
-                          bi: &mut FxHashMap<(u32, u32), u32>,
-                          uni: &mut FxHashMap<u32, u32>| {
-        let ids = seg.segment(s, &words.surface_to_id);
-        for &id in &ids {
-            *uni.entry(id).or_insert(0) += weight;
-        }
-        for w in ids.windows(2) {
-            *bi.entry((w[0], w[1])).or_insert(0) += weight;
-        }
-    };
+    let count_sentence =
+        |s: &str,
+         weight: u32,
+         uni: &mut FxHashMap<u32, u32>,
+         bi: &mut FxHashMap<(u32, u32), u32>,
+         tri: &mut FxHashMap<(u32, u32, u32), u32>| {
+            let ids = seg.segment(s, &words.surface_to_id);
+            for &id in &ids {
+                *uni.entry(id).or_insert(0) += weight;
+            }
+            for w in ids.windows(2) {
+                *bi.entry((w[0], w[1])).or_insert(0) += weight;
+            }
+            for w in ids.windows(3) {
+                *tri.entry((w[0], w[1], w[2])).or_insert(0) += weight;
+            }
+        };
 
     let mut used_corpus = false;
 
-    // (a) General-domain corpus: Toutiao news headlines + keywords (weight 1).
-    //     This corpus is ~6x larger than the shopping one; to keep the in-domain
-    //     shopping signal from being swamped (the EVAL gold set is shopping-derived)
-    //     the shopping corpus below is counted with a higher weight. The general
-    //     corpus still supplies enough mass to fix common phrases (我是/我们/今天/...).
     if let Some(tt_path) = corpus_toutiao {
         eprintln!("  reading general corpus {} ...", tt_path.display());
         let sentences = read_toutiao_sentences(tt_path)?;
         eprintln!("  general (toutiao) sentences: {}", sentences.len());
         for s in &sentences {
-            count_sentence(s, 1, &mut bi_counts, &mut uni_counts);
+            count_sentence(s, 1, &mut uni_counts, &mut bi_counts, &mut tri_counts);
         }
         used_corpus = true;
     }
 
-    // (b) Domain corpus: online shopping reviews (weight SHOPPING_WEIGHT). Also the
-    //     source of held-out eval.
     if let Some(csv_path) = corpus_csv {
         eprintln!("  reading sentence corpus {} ...", csv_path.display());
         let sentences = read_corpus_sentences(csv_path)?;
         eprintln!("  corpus sentences: {}", sentences.len());
-        // Reserve a held-out tail for eval; train on the rest.
         let n = sentences.len();
         let split = n.saturating_sub(HELDOUT_SENTENCES);
         for (i, s) in sentences.iter().enumerate() {
@@ -424,71 +728,104 @@ fn build_and_write_bigram(
                 }
                 continue;
             }
-            count_sentence(s, SHOPPING_WEIGHT, &mut bi_counts, &mut uni_counts);
+            count_sentence(
+                s,
+                SHOPPING_WEIGHT,
+                &mut uni_counts,
+                &mut bi_counts,
+                &mut tri_counts,
+            );
         }
         used_corpus = true;
     }
 
-    // Fallback / augmentation: derive bigrams from multi-word phrase readings by
-    // segmenting each phrase-pinyin surface as a "sentence". This guarantees a
-    // non-trivial bigram.fst even with no sentence corpus.
     if !used_corpus {
-        eprintln!("  FALLBACK: building bigrams from dictionary phrases ...");
+        eprintln!("  FALLBACK: building n-grams from dictionary phrases ...");
         for e in &words.entries {
-            // Multi-char surfaces only — segment them into sub-words.
             if e.surface.chars().count() >= 2 {
-                count_sentence(&e.surface, 1, &mut bi_counts, &mut uni_counts);
+                count_sentence(
+                    &e.surface,
+                    1,
+                    &mut uni_counts,
+                    &mut bi_counts,
+                    &mut tri_counts,
+                );
             }
         }
     }
 
-    // Prune low-count pairs, then cap to the highest-count MAX_BIGRAMS to bound size.
+    // --- bigram.fst ---------------------------------------------------------
     let mut pairs: Vec<((u32, u32), u32)> = bi_counts
-        .into_iter()
-        .filter(|&(_, c)| c >= BIGRAM_MIN_COUNT)
+        .iter()
+        .filter(|&(_, &c)| c >= BIGRAM_MIN_COUNT)
+        .map(|(&k, &c)| (k, c))
         .collect();
     if pairs.len() > MAX_BIGRAMS {
-        eprintln!(
-            "  pruning bigrams {} -> {} (highest-count first)",
-            pairs.len(),
-            MAX_BIGRAMS
-        );
+        eprintln!("  pruning bigrams {} -> {}", pairs.len(), MAX_BIGRAMS);
         pairs.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         pairs.truncate(MAX_BIGRAMS);
     }
-    // fst keys must be inserted in sorted order of the 8-byte BE key.
     pairs.sort_unstable_by_key(|&((p, i), _)| ((p as u64) << 32) | i as u64);
 
-    let bigram_file = std::fs::File::create(out_dir.join("bigram.fst")).context("create bigram.fst")?;
-    let wtr = std::io::BufWriter::new(bigram_file);
-    let mut bb = fst::MapBuilder::new(wtr).context("bigram MapBuilder")?;
+    let bigram_file =
+        std::fs::File::create(out_dir.join("bigram.fst")).context("create bigram.fst")?;
+    let mut bb =
+        fst::MapBuilder::new(std::io::BufWriter::new(bigram_file)).context("bigram MapBuilder")?;
     let mut n_bigrams: u64 = 0;
-    for ((prev, id), count) in &pairs {
+    for &((prev, id), count) in &pairs {
         // P(id | prev) = count(prev,id) / count(prev)
-        let denom = *uni_counts.get(prev).unwrap_or(&0) as f64;
-        let prob = if denom > 0.0 { *count as f64 / denom } else { 0.0 };
-        let cost = prob_to_cost(prob) as u64;
-        let key = pyime_core::format::bigram_key(*prev, *id);
-        bb.insert(key, cost).context("bigram insert")?;
+        let denom = *uni_counts.get(&prev).unwrap_or(&0) as f64;
+        let prob = if denom > 0.0 { count as f64 / denom } else { 0.0 };
+        let cost = prob_to_cost_u64(prob);
+        bb.insert(pyime_core::format::bigram_key(prev, id), cost)
+            .context("bigram insert")?;
         n_bigrams += 1;
     }
     bb.finish().context("bigram finish")?;
 
-    let _ = corpus_dir;
-    Ok((n_bigrams, heldout))
+    // --- trigram.fst --------------------------------------------------------
+    // trigram cost(w1,w2,w3) = -500*ln( count(w1,w2,w3) / count(w1,w2) ).
+    let mut triples: Vec<((u32, u32, u32), u32)> = tri_counts
+        .iter()
+        .filter(|&(_, &c)| c >= TRIGRAM_MIN_COUNT)
+        .map(|(&k, &c)| (k, c))
+        .collect();
+    if triples.len() > MAX_TRIGRAMS {
+        eprintln!("  pruning trigrams {} -> {}", triples.len(), MAX_TRIGRAMS);
+        triples.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        triples.truncate(MAX_TRIGRAMS);
+    }
+    triples.sort_unstable_by_key(|&((a, b, c), _)| {
+        // 12-byte BE order == (a,b,c) lexicographic; encode into u128 for the sort key.
+        ((a as u128) << 64) | ((b as u128) << 32) | (c as u128)
+    });
+
+    let trigram_file =
+        std::fs::File::create(out_dir.join("trigram.fst")).context("create trigram.fst")?;
+    let mut tb =
+        fst::MapBuilder::new(std::io::BufWriter::new(trigram_file)).context("trigram MapBuilder")?;
+    let mut n_trigrams: u64 = 0;
+    for &((w1, w2, w3), count) in &triples {
+        let denom = *bi_counts.get(&(w1, w2)).unwrap_or(&0) as f64;
+        let prob = if denom > 0.0 { count as f64 / denom } else { 0.0 };
+        let cost = prob_to_cost_u64(prob);
+        tb.insert(pyime_core::format::trigram_key(w1, w2, w3), cost)
+            .context("trigram insert")?;
+        n_trigrams += 1;
+    }
+    tb.finish().context("trigram finish")?;
+
+    Ok((n_bigrams, n_trigrams, heldout))
 }
 
 /// Read review sentences from the online_shopping CSV (`cat,label,review`).
-/// We split multi-clause reviews on Chinese punctuation into shorter sentences.
 fn read_corpus_sentences(csv_path: &Path) -> Result<Vec<String>> {
     let raw = std::fs::read_to_string(csv_path).context("read corpus csv")?;
     let mut out = Vec::new();
     for (i, line) in raw.lines().enumerate() {
         if i == 0 {
-            continue; // header
+            continue;
         }
-        // review is everything after the 2nd comma (reviews contain no commas in
-        // this dataset's escaping; if they do, the tail still forms valid text).
         let mut parts = line.splitn(3, ',');
         let _cat = parts.next();
         let _label = parts.next();
@@ -499,15 +836,8 @@ fn read_corpus_sentences(csv_path: &Path) -> Result<Vec<String>> {
         if review.is_empty() {
             continue;
         }
-        // Split into clause-sized sentences on common CJK terminators.
-        for clause in review.split(|c| {
-            matches!(
-                c,
-                '。' | '！' | '？' | '；' | '，' | '、' | '\n' | '!' | '?' | ';' | ','
-            )
-        }) {
+        for clause in review.split(is_sentence_split) {
             let clause = clause.trim();
-            // Keep clauses with at least 2 CJK chars and not absurdly long.
             let cjk = clause.chars().filter(|&c| pinyin::is_cjk(c)).count();
             if cjk >= 2 && clause.chars().count() <= 40 {
                 out.push(clause.to_string());
@@ -518,42 +848,11 @@ fn read_corpus_sentences(csv_path: &Path) -> Result<Vec<String>> {
 }
 
 /// Read general-domain sentences from the Toutiao news-title dataset.
-/// Each line is `id_!_code_!_category_!_title_!_keyword,keyword,...`.
-/// We take the title (general-domain news headline) and each keyword as separate
-/// clause-sized "sentences", split further on CJK punctuation like the shopping
-/// reader, so the bigram LM sees natural everyday phrasing.
 fn read_toutiao_sentences(path: &Path) -> Result<Vec<String>> {
     let raw = std::fs::read_to_string(path).context("read toutiao corpus")?;
     let mut out = Vec::new();
     let push_text = |text: &str, out: &mut Vec<String>| {
-        for clause in text.split(|c| {
-            matches!(
-                c,
-                '。' | '！'
-                    | '？'
-                    | '；'
-                    | '，'
-                    | '、'
-                    | '\n'
-                    | '!'
-                    | '?'
-                    | ';'
-                    | ','
-                    | '：'
-                    | ':'
-                    | '“'
-                    | '”'
-                    | '（'
-                    | '）'
-                    | '('
-                    | ')'
-                    | '《'
-                    | '》'
-                    | '【'
-                    | '】'
-                    | '|'
-            )
-        }) {
+        for clause in text.split(is_sentence_split) {
             let clause = clause.trim();
             let cjk = clause.chars().filter(|&c| pinyin::is_cjk(c)).count();
             if cjk >= 2 && clause.chars().count() <= 40 {
@@ -562,7 +861,6 @@ fn read_toutiao_sentences(path: &Path) -> Result<Vec<String>> {
         }
     };
     for line in raw.lines() {
-        // Fields are separated by the literal token `_!_`.
         let mut fields = line.split("_!_");
         let _id = fields.next();
         let _code = fields.next();
@@ -571,16 +869,53 @@ fn read_toutiao_sentences(path: &Path) -> Result<Vec<String>> {
             push_text(title, &mut out);
         }
         if let Some(keywords) = fields.next() {
-            // keywords are comma-separated; push_text already splits on commas.
             push_text(keywords, &mut out);
         }
     }
     Ok(out)
 }
 
+/// Shared CJK/ASCII sentence/segment splitter (CJK punctuation + ASCII terminators).
+#[inline]
+fn is_sentence_split(c: char) -> bool {
+    matches!(
+        c,
+        '。' | '！'
+            | '？'
+            | '；'
+            | '，'
+            | '、'
+            | '\n'
+            | '\r'
+            | '\t'
+            | '!'
+            | '?'
+            | ';'
+            | ','
+            | '：'
+            | ':'
+            | '“'
+            | '”'
+            | '‘'
+            | '’'
+            | '（'
+            | '）'
+            | '('
+            | ')'
+            | '《'
+            | '》'
+            | '【'
+            | '】'
+            | '|'
+            | ' '
+            | '~'
+            | '—'
+            | '…'
+    )
+}
+
 /// Max-munch segmenter over dictionary surfaces.
 struct Segmenter {
-    /// max surface char-length, to bound the munch window.
     max_len: usize,
 }
 
@@ -591,12 +926,11 @@ impl Segmenter {
             .map(|s| s.chars().count())
             .max()
             .unwrap_or(1)
-            .min(8); // bound to keep segmentation cheap
+            .min(8);
         Segmenter { max_len }
     }
 
     /// Greedy longest-match segmentation of a CJK run into known word ids.
-    /// Unknown single chars are skipped (do not contribute to bigrams).
     fn segment(&self, s: &str, surface_to_id: &FxHashMap<String, u32>) -> Vec<u32> {
         let chars: Vec<char> = s.chars().filter(|&c| pinyin::is_cjk(c)).collect();
         let mut out = Vec::new();
@@ -616,7 +950,7 @@ impl Segmenter {
                 j -= 1;
             }
             if !matched {
-                i += 1; // skip unknown char
+                i += 1;
             }
         }
         out
@@ -628,17 +962,9 @@ impl Segmenter {
 // ===========================================================================
 
 fn write_english(out_dir: &Path, english_raw: &[u8], english_freq_raw: &[u8]) -> Result<u64> {
-    // Assign each candidate word a "rank" (lower = more common / higher priority).
-    // 1. Words from the google-10000-english frequency list get their line index as
-    //    rank, so the most common everyday words (including longer ones like
-    //    "computer", "keyboard", "android", "version") are always kept.
-    // 2. The remaining slots are filled from the big dwyl list, ranked by length
-    //    (shorter ≈ more common) as a secondary proxy.
     let mut rank: FxHashMap<String, u64> = FxHashMap::default();
-
     let is_word = |w: &str| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase());
 
-    // Frequency list first (authoritative ranks 0..N).
     if let Ok(freq_text) = std::str::from_utf8(english_freq_raw) {
         for (i, line) in freq_text.lines().enumerate() {
             let w = line.trim().to_ascii_lowercase();
@@ -649,20 +975,16 @@ fn write_english(out_dir: &Path, english_raw: &[u8], english_freq_raw: &[u8]) ->
     }
     let freq_count = rank.len() as u64;
 
-    // Dwyl list: assign a rank AFTER the frequency block, keyed by word length so
-    // shorter (more common) words sort ahead, then lexicographically for stability.
     if let Ok(text) = std::str::from_utf8(english_raw) {
         for line in text.lines() {
             let w = line.trim().to_ascii_lowercase();
             if is_word(&w) && !rank.contains_key(&w) {
-                // Base offset past the freq block; length dominates the ordering.
                 let r = freq_count + (w.len() as u64) * 1_000_000;
                 rank.insert(w, r);
             }
         }
     }
 
-    // Select the top-MAX_ENGLISH by rank, then sort lexically for fst insertion.
     let mut ranked: Vec<(u64, String)> = rank.into_iter().map(|(w, r)| (r, w)).collect();
     ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     ranked.truncate(MAX_ENGLISH);
@@ -671,8 +993,8 @@ fn write_english(out_dir: &Path, english_raw: &[u8], english_freq_raw: &[u8]) ->
     words.dedup();
 
     let file = std::fs::File::create(out_dir.join("english.fst")).context("create english.fst")?;
-    let wtr = std::io::BufWriter::new(file);
-    let mut sb = fst::SetBuilder::new(wtr).context("english SetBuilder")?;
+    let mut sb =
+        fst::SetBuilder::new(std::io::BufWriter::new(file)).context("english SetBuilder")?;
     for w in &words {
         sb.insert(w).context("english insert")?;
     }
@@ -690,7 +1012,10 @@ fn dir_data_bytes(out_dir: &Path) -> u64 {
         "lexicon.fst",
         "postings.bin",
         "bigram.fst",
+        "trigram.fst",
         "english.fst",
+        "word_pinyin.tsv",
+        "hanzi_pinyin.tsv",
     ];
     files
         .iter()
@@ -704,21 +1029,25 @@ fn write_meta(
     num_words: u64,
     num_readings: u64,
     num_bigrams: u64,
+    num_trigrams: u64,
     source_notes: &str,
 ) -> Result<()> {
-    // bytes_total counts the core binary artifacts (meta itself excluded).
     let bytes_total = dir_data_bytes(out_dir);
-    let meta = pyime_core::format::Meta {
-        version: pyime_core::format::FORMAT_VERSION,
-        log_base: LOG_BASE as f32,
-        num_words,
-        num_readings,
-        num_bigrams,
-        bytes_total,
-        source_notes: source_notes.to_string(),
-    };
-    let json = serde_json::to_string_pretty(&meta).context("serialize meta")?;
-    std::fs::write(out_dir.join("meta.json"), json).context("write meta.json")?;
+    // We extend the core `Meta` JSON with an extra `num_trigrams` key. The core
+    // `Meta` deserializer ignores unknown fields, so this stays format-compatible
+    // while exposing the trigram count. Build the JSON object explicitly.
+    let json = serde_json::json!({
+        "version": pyime_core::format::FORMAT_VERSION,
+        "log_base": LOG_BASE as f32,
+        "num_words": num_words,
+        "num_readings": num_readings,
+        "num_bigrams": num_bigrams,
+        "num_trigrams": num_trigrams,
+        "bytes_total": bytes_total,
+        "source_notes": source_notes,
+    });
+    let txt = serde_json::to_string_pretty(&json).context("serialize meta")?;
+    std::fs::write(out_dir.join("meta.json"), txt).context("write meta.json")?;
     Ok(())
 }
 
@@ -749,7 +1078,6 @@ fn write_heldout(
             writeln!(file, "{s}")?;
         }
     } else {
-        // Fallback: sample multi-char dictionary phrases as pseudo-sentences.
         notes.push("heldout=FALLBACK(dict-phrases)".into());
         let mut count = 0;
         for e in &words.entries {
@@ -775,31 +1103,53 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
     use fst::{Map, Set};
 
     let meta_txt = std::fs::read_to_string(out_dir.join("meta.json")).context("read meta.json")?;
-    let meta: pyime_core::format::Meta = serde_json::from_str(&meta_txt).context("parse meta.json")?;
+    let meta: pyime_core::format::Meta =
+        serde_json::from_str(&meta_txt).context("parse meta.json")?;
+    // also pull num_trigrams out of the raw JSON (not in the core Meta struct).
+    let raw_meta: serde_json::Value = serde_json::from_str(&meta_txt).unwrap_or_default();
+    let meta_trigrams = raw_meta
+        .get("num_trigrams")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
-    // words.bin
     let words_bytes = std::fs::read(out_dir.join("words.bin")).context("read words.bin")?;
     let archived = rkyv::check_archived_root::<Vec<pyime_core::format::WordEntry>>(&words_bytes)
         .map_err(|e| anyhow::anyhow!("validate words.bin: {e}"))?;
     let num_words = archived.len();
 
-    // lexicon.fst
     let lex_bytes = std::fs::read(out_dir.join("lexicon.fst")).context("read lexicon.fst")?;
     let lex = Map::new(lex_bytes).context("open lexicon.fst")?;
     let num_readings = lex.len() as u64;
 
-    // postings.bin sanity: read one posting at a sampled key offset.
     let postings = std::fs::read(out_dir.join("postings.bin")).context("read postings.bin")?;
 
-    // bigram.fst
     let bi_bytes = std::fs::read(out_dir.join("bigram.fst")).context("read bigram.fst")?;
     let bi = Map::new(bi_bytes).context("open bigram.fst")?;
     let num_bigrams = bi.len() as u64;
 
-    // english.fst
+    // trigram.fst (NEW)
+    let tri_bytes = std::fs::read(out_dir.join("trigram.fst")).context("read trigram.fst")?;
+    let tri = Map::new(tri_bytes).context("open trigram.fst")?;
+    let num_trigrams = tri.len() as u64;
+
     let en_bytes = std::fs::read(out_dir.join("english.fst")).context("read english.fst")?;
     let en = Set::new(en_bytes).context("open english.fst")?;
     let num_english = en.len();
+
+    // word_pinyin.tsv (NEW): count lines, sanity-check tab structure.
+    let wp_txt =
+        std::fs::read_to_string(out_dir.join("word_pinyin.tsv")).context("read word_pinyin.tsv")?;
+    let mut wp_lines = 0u64;
+    for line in wp_txt.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        anyhow::ensure!(
+            line.split('\t').count() == 2,
+            "word_pinyin.tsv malformed line: {line}"
+        );
+        wp_lines += 1;
+    }
 
     let bytes_total = dir_data_bytes(out_dir);
 
@@ -810,15 +1160,18 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
     eprintln!("  lexicon.fst    : {num_readings} readings (meta {})", meta.num_readings);
     eprintln!("  postings.bin   : {} bytes", postings.len());
     eprintln!("  bigram.fst     : {num_bigrams} pairs (meta {})", meta.num_bigrams);
+    eprintln!("  trigram.fst    : {num_trigrams} triples (meta {meta_trigrams})");
     eprintln!("  english.fst    : {num_english} terms");
+    eprintln!("  word_pinyin.tsv: {wp_lines} entries");
     eprintln!("  bytes_total    : {bytes_total} ({:.2} MB)", bytes_total as f64 / 1e6);
 
     anyhow::ensure!(num_words as u64 == meta.num_words, "words count mismatch");
     anyhow::ensure!(num_readings == meta.num_readings, "readings count mismatch");
     anyhow::ensure!(num_bigrams == meta.num_bigrams, "bigram count mismatch");
+    anyhow::ensure!(num_trigrams == meta_trigrams, "trigram count mismatch");
+    anyhow::ensure!(wp_lines == num_words as u64, "word_pinyin.tsv count mismatch");
     anyhow::ensure!(!postings.is_empty(), "postings.bin empty");
 
-    // Spot-check: first key in lexicon resolves to a valid posting.
     if let Some((kbytes, off)) = lex.stream_first() {
         let off = off as usize;
         anyhow::ensure!(off + 2 <= postings.len(), "posting offset OOB");
@@ -828,10 +1181,15 @@ pub fn verify(out_dir: &Path) -> Result<pyime_core::format::Meta> {
         eprintln!("  spot-check key '{key}' -> {n} candidate(s)");
     }
 
+    // trigram spot-check: first key decodes to a valid 12-byte structure.
+    if let Some((kbytes, _)) = tri.stream_first() {
+        anyhow::ensure!(kbytes.len() == 12, "trigram key not 12 bytes");
+    }
+
     Ok(meta)
 }
 
-// Small fst helper: first key+value of a Map (fst 0.4 has no direct accessor).
+// Small fst helper: first key+value of a Map.
 trait MapFirst {
     fn stream_first(&self) -> Option<(Vec<u8>, u64)>;
 }
@@ -862,8 +1220,17 @@ mod tests {
         assert_eq!(pinyin::normalize_syllable("zhong4"), "zhong");
     }
 
-    /// If a built data dir exists, query the lexicon for known readings and confirm
-    /// the expected surfaces are present in the posting list.
+    #[test]
+    fn rime_reading_normalization() {
+        assert_eq!(
+            pinyin::normalize_reading("zhong guo").as_deref(),
+            Some("zhong'guo")
+        );
+        assert_eq!(pinyin::normalize_reading("nǐ hǎo").as_deref(), Some("ni'hao"));
+        assert_eq!(pinyin::normalize_reading("  ").as_deref(), None);
+    }
+
+    /// If a built data dir exists, confirm key curated readings are correct.
     #[test]
     fn lexicon_roundtrip_if_built() {
         let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data"));
@@ -900,6 +1267,7 @@ mod tests {
         };
         check("ni'hao", "你好");
         check("bei'jing", "北京");
-        check("chong'qing", "重庆"); // phrase-override disambiguation (not zhong'qing)
+        check("wo'shi", "我是");
+        check("zhong'guo", "中国");
     }
 }

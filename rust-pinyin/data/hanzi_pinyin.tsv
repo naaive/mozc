@@ -1941,7 +1941,7 @@
 㴑	su
 㴒	yi
 㴓	shai
-㴔	yi
+㴔	ji
 㴕	ji
 㴖	luo
 㴗	you
@@ -3495,7 +3495,7 @@
 䏯	zhi
 䏰	run
 䏱	ju
-䏲	die
+䏲	ti
 䏳	zhe
 䏴	shao
 䏵	meng
@@ -5420,6 +5420,7 @@
 䰰	ru
 䰱	ling
 䰲	ya
+䰳	ding
 䰴	qi
 䰵	zi
 䰷	bang
@@ -5793,7 +5794,7 @@
 丄	shang
 丅	xia
 丆	han
-万	wan
+万	mo
 丈	zhang
 三	san
 上	shang
@@ -5846,7 +5847,7 @@
 丹	dan
 为	wei
 主	zhu
-丼	jing
+丼	dan
 丽	li
 举	ju
 丿	pie
@@ -6089,7 +6090,7 @@
 伬	ze
 伭	xian
 伮	nu
-伯	bo
+伯	bai
 估	gu
 伱	ni
 伲	ni
@@ -6133,7 +6134,7 @@
 佘	she
 余	yu
 佚	yi
-佛	fu
+佛	bi
 作	zuo
 佝	gou
 佞	ning
@@ -6158,7 +6159,7 @@
 佱	fa
 佲	ming
 佳	jia
-佴	er
+佴	nai
 併	bing
 佶	ji
 佷	hen
@@ -6426,7 +6427,7 @@
 偽	wei
 偾	fen
 偿	chang
-傀	gui
+傀	kui
 傁	sou
 傂	zhi
 傃	su
@@ -6673,7 +6674,7 @@
 其	qi
 具	ju
 典	dian
-兹	zi
+兹	ci
 兺	fen
 养	yang
 兼	jian
@@ -6848,7 +6849,7 @@
 別	bie
 刦	jie
 刧	jie
-刨	pao
+刨	bao
 利	li
 刪	shan
 别	bie
@@ -6865,7 +6866,7 @@
 制	zhi
 刷	shua
 券	quan
-刹	sha
+刹	cha
 刺	ci
 刻	ke
 刼	jie
@@ -6882,8 +6883,8 @@
 則	ze
 剈	yuan
 剉	cuo
-削	xue
-剋	ke
+削	xiao
+剋	kei
 剌	la
 前	qian
 剎	sha
@@ -6909,7 +6910,7 @@
 剢	du
 剣	jian
 剤	ji
-剥	bo
+剥	bao
 剦	yan
 剧	ju
 剨	huo
@@ -7018,7 +7019,7 @@
 勏	bu
 勐	meng
 勑	chi
-勒	lei
+勒	le
 勓	kai
 勔	mian
 動	dong
@@ -7089,7 +7090,7 @@
 化	hua
 北	bei
 匘	nao
-匙	shi
+匙	chi
 匚	fang
 匛	jiu
 匜	yi
@@ -7110,7 +7111,7 @@
 匫	hu
 匬	yu
 匭	gui
-匮	kui
+匮	gui
 匯	hui
 匰	dan
 匱	gui
@@ -7122,7 +7123,7 @@
 匷	jue
 匸	xi
 匹	pi
-区	qu
+区	ou
 医	yi
 匼	ke
 匽	yan
@@ -7146,12 +7147,12 @@
 协	xie
 卐	wan
 卑	bei
-卒	zu
+卒	cu
 卓	zhuo
 協	xie
-单	dan
+单	chan
 卖	mai
-南	nan
+南	na
 単	dan
 卙	ji
 博	bo
@@ -7214,7 +7215,7 @@
 厓	ya
 厔	zhi
 厕	ce
-厖	pang
+厖	mang
 厗	ti
 厘	li
 厙	she
@@ -7282,7 +7283,7 @@
 受	shou
 变	bian
 叙	xu
-叚	jia
+叚	xia
 叛	pan
 叜	sou
 叝	ji
@@ -7293,14 +7294,14 @@
 叢	cong
 口	kou
 古	gu
-句	ju
+句	gou
 另	ling
 叧	gua
 叨	dao
 叩	kou
 只	zhi
 叫	jiao
-召	zhao
+召	shao
 叭	ba
 叮	ding
 可	ke
@@ -7310,7 +7311,7 @@
 右	you
 叴	qiu
 叵	po
-叶	ye
+叶	xie
 号	hao
 司	si
 叹	tan
@@ -7328,7 +7329,7 @@
 吅	xuan
 吆	yao
 吇	zi
-合	he
+合	ge
 吉	ji
 吊	diao
 吋	cun
@@ -7339,10 +7340,10 @@
 吐	tu
 向	xiang
 吒	zha
-吓	xia
+吓	he
 吔	ye
 吕	lv
-吖	ya
+吖	a
 吗	ma
 吘	ou
 吙	huo
@@ -7365,7 +7366,7 @@
 吪	e
 含	han
 听	ting
-吭	keng
+吭	hang
 吮	shun
 启	qi
 吰	hong
@@ -7391,7 +7392,7 @@
 呄	ge
 呅	mei
 呆	dai
-呇	qi
+呇	men
 呈	cheng
 呉	wu
 告	gao
@@ -7402,7 +7403,7 @@
 呏	sheng
 呐	na
 呑	tun
-呒	wu
+呒	mu
 呓	yi
 呔	dai
 呕	ou
@@ -7439,7 +7440,7 @@
 呴	xu
 呵	he
 呶	nao
-呷	ga
+呷	xia
 呸	pei
 呹	yi
 呺	xiao
@@ -7455,7 +7456,7 @@
 咄	duo
 咅	pou
 咆	pao
-咇	bie
+咇	bi
 咈	fu
 咉	yang
 咊	he
@@ -7470,7 +7471,7 @@
 咓	wa
 咔	ka
 咕	gu
-咖	ka
+咖	ga
 咗	zuo
 咘	bu
 咙	long
@@ -7499,7 +7500,7 @@
 咰	shu
 咱	zan
 咲	xiao
-咳	ke
+咳	hai
 咴	hui
 咵	kua
 咶	huai
@@ -7550,7 +7551,7 @@
 哣	pou
 哤	mang
 哥	ge
-哦	o
+哦	e
 哧	chi
 哨	shao
 哩	li
@@ -7603,9 +7604,9 @@
 唘	qi
 唙	di
 唚	qin
-唛	ma
+唛	mai
 唜	mo
-唝	gong
+唝	hong
 唞	dou
 唟	qu
 唠	lao
@@ -7755,7 +7756,7 @@
 喰	can
 喱	li
 喲	yo
-喳	zha
+喳	cha
 喴	wei
 喵	miao
 営	ying
@@ -7772,7 +7773,7 @@
 嗁	ti
 嗂	yao
 嗃	he
-嗄	a
+嗄	sha
 嗅	xiu
 嗆	qiang
 嗇	se
@@ -7814,10 +7815,10 @@
 嗬	he
 嗭	zhi
 嗮	sai
-嗯	n
+嗯	eng
 嗰	ge
 嗱	na
-嗲	die
+嗲	dia
 嗳	ai
 嗴	qiang
 嗵	tong
@@ -7855,13 +7856,13 @@
 嘕	xian
 嘖	ze
 嘗	chang
-嘘	xu
+嘘	shi
 嘙	po
 嘚	de
 嘛	ma
 嘜	ma
 嘝	hu
-嘞	lei
+嘞	le
 嘟	du
 嘠	ga
 嘡	tang
@@ -7875,7 +7876,7 @@
 嘩	hua
 嘪	mai
 嘫	ran
-嘬	chuai
+嘬	zuo
 嘭	peng
 嘮	lao
 嘯	xiao
@@ -8019,7 +8020,7 @@
 嚹	la
 嚺	ta
 嚻	xiao
-嚼	jue
+嚼	jiao
 嚽	chuo
 嚾	huan
 嚿	huo
@@ -8095,11 +8096,11 @@
 圅	han
 圆	yuan
 圇	lun
-圈	quan
+圈	juan
 圉	yu
 圊	qing
 國	guo
-圌	chuan
+圌	chui
 圍	wei
 圎	yuan
 圏	quan
@@ -8130,12 +8131,12 @@
 在	zai
 圩	wei
 圪	ge
-圫	yu
+圫	tuo
 圬	wu
 圭	gui
 圮	pi
 圯	yi
-地	di
+地	de
 圱	qian
 圲	qian
 圳	zhen
@@ -8162,7 +8163,7 @@
 坈	rong
 坉	tun
 坊	fang
-坋	ben
+坋	fen
 坌	ben
 坍	tan
 坎	kan
@@ -8195,7 +8196,7 @@
 坩	gan
 坪	ping
 坫	dian
-坬	gua
+坬	wa
 坭	ni
 坮	tai
 坯	pi
@@ -8210,7 +8211,7 @@
 坸	gou
 坹	xue
 坺	ba
-坻	chi
+坻	di
 坼	che
 坽	ling
 坾	zhu
@@ -8299,7 +8300,7 @@
 埑	zhe
 埒	lie
 埓	lie
-埔	pu
+埔	bu
 埕	cheng
 埖	hua
 埗	bu
@@ -8322,7 +8323,7 @@
 埨	lun
 埩	zheng
 埪	kong
-埫	chong
+埫	tang
 埬	dong
 埭	dai
 埮	tan
@@ -8383,7 +8384,7 @@
 堥	mao
 堦	jie
 堧	ruan
-堨	ye
+堨	e
 堩	geng
 堪	kan
 堫	zong
@@ -8393,7 +8394,7 @@
 堯	yao
 堰	yan
 報	bao
-堲	ci
+堲	ji
 堳	mei
 場	chang
 堵	du
@@ -8646,7 +8647,7 @@
 夬	guai
 夭	yao
 央	yang
-夯	hang
+夯	ben
 夰	gao
 失	shi
 夲	tao
@@ -8670,7 +8671,7 @@
 奄	yan
 奅	pao
 奆	juan
-奇	qi
+奇	ji
 奈	nai
 奉	feng
 奊	xie
@@ -8766,7 +8767,7 @@
 妤	yu
 妥	tuo
 妦	feng
-妧	wan
+妧	yuan
 妨	fang
 妩	wu
 妪	yu
@@ -8955,7 +8956,7 @@
 婡	lai
 婢	bi
 婣	yin
-婤	chou
+婤	zhou
 婥	chuo
 婦	fu
 婧	jing
@@ -8979,7 +8980,7 @@
 婹	yao
 婺	wu
 婻	nan
-婼	chuo
+婼	ruo
 婽	jia
 婾	tou
 婿	xu
@@ -9166,7 +9167,7 @@
 嬴	ying
 嬵	mian
 嬶	bi
-嬷	ma
+嬷	mo
 嬸	shen
 嬹	xing
 嬺	ni
@@ -9180,7 +9181,7 @@
 孂	jiao
 孃	niang
 孄	lan
-孅	qian
+孅	xian
 孆	ying
 孇	shuang
 孈	hui
@@ -9224,7 +9225,7 @@
 孮	cong
 孯	qian
 孰	shu
-孱	can
+孱	chan
 孲	ya
 孳	zi
 孴	ni
@@ -9258,7 +9259,7 @@
 宐	yi
 宑	jing
 宒	zhun
-宓	mi
+宓	fu
 宔	zhu
 宕	dang
 宖	hong
@@ -9401,7 +9402,7 @@
 尟	xian
 尠	xian
 尡	kun
-尢	you
+尢	wang
 尣	wang
 尤	you
 尥	liao
@@ -9425,7 +9426,7 @@
 尷	gan
 尸	shi
 尹	yin
-尺	chi
+尺	che
 尻	kao
 尼	ni
 尽	jin
@@ -9446,7 +9447,7 @@
 屌	diao
 屍	shi
 屎	shi
-屏	ping
+屏	bing
 屐	ji
 屑	xie
 屒	zhen
@@ -9477,7 +9478,7 @@
 屫	jue
 屬	shu
 屭	xi
-屮	che
+屮	cao
 屯	tun
 屰	ni
 山	shan
@@ -9535,7 +9536,7 @@
 岥	po
 岦	li
 岧	tiao
-岨	qu
+岨	ju
 岩	yan
 岪	fu
 岫	xiu
@@ -9584,9 +9585,9 @@
 峖	an
 峗	wei
 峘	huan
-峙	zhi
+峙	shi
 峚	mi
-峛	li
+峛	lie
 峜	ji
 峝	tong
 峞	wei
@@ -9622,7 +9623,7 @@
 峼	gao
 峽	xia
 峾	yin
-峿	yu
+峿	wu
 崀	lang
 崁	kan
 崂	lao
@@ -9789,7 +9790,7 @@
 嶣	jiao
 嶤	yao
 嶥	jue
-嶦	zhan
+嶦	shan
 嶧	yi
 嶨	xue
 嶩	nao
@@ -9870,7 +9871,7 @@
 巴	ba
 巵	zhi
 巶	zhao
-巷	xiang
+巷	hang
 巸	yi
 巹	jin
 巺	xun
@@ -10077,7 +10078,7 @@
 廃	fei
 廄	jiu
 廅	e
-廆	gui
+廆	wei
 廇	liu
 廈	sha
 廉	lian
@@ -10139,7 +10140,7 @@
 弁	bian
 异	yi
 弃	qi
-弄	nong
+弄	long
 弅	fen
 弆	ju
 弇	yan
@@ -10193,7 +10194,7 @@
 強	qiang
 弸	peng
 弹	dan
-强	qiang
+强	jiang
 弻	bi
 弼	bi
 弽	she
@@ -10316,7 +10317,7 @@
 徲	ti
 徳	de
 徴	zheng
-徵	zheng
+徵	zhi
 徶	bie
 德	de
 徸	chong
@@ -10915,7 +10916,7 @@
 戉	yue
 戊	wu
 戋	jian
-戌	xu
+戌	qu
 戍	shu
 戎	rong
 戏	xi
@@ -10930,7 +10931,7 @@
 战	zhan
 戙	dong
 戚	qi
-戛	jia
+戛	ga
 戜	die
 戝	zei
 戞	jia
@@ -10981,7 +10982,7 @@
 手	shou
 扌	shou
 才	cai
-扎	zha
+扎	za
 扏	qiu
 扐	le
 扑	pu
@@ -10994,10 +10995,10 @@
 托	tuo
 扙	zhang
 扚	diao
-扛	kang
+扛	gang
 扜	yu
 扝	ku
-扞	gan
+扞	han
 扟	shen
 扠	cha
 扡	tuo
@@ -11055,7 +11056,7 @@
 投	tou
 抖	dou
 抗	kang
-折	zhe
+折	she
 抙	pou
 抚	fu
 抛	pao
@@ -11088,7 +11089,7 @@
 抶	chi
 抷	pi
 抸	jia
-抹	mo
+抹	ma
 抺	mei
 抻	chen
 押	ya
@@ -11114,7 +11115,7 @@
 拐	guai
 拑	qian
 拒	ju
-拓	tuo
+拓	ta
 拔	ba
 拕	tuo
 拖	tuo
@@ -11157,7 +11158,7 @@
 拻	hui
 拼	pin
 拽	zhuai
-拾	shi
+拾	she
 拿	na
 挀	bai
 持	chi
@@ -11234,7 +11235,7 @@
 捈	tu
 捉	zhuo
 捊	pou
-捋	lv
+捋	luo
 捌	ba
 捍	han
 捎	shao
@@ -11317,7 +11318,7 @@
 掛	gua
 掜	yi
 掝	huo
-掞	shan
+掞	yan
 掟	zheng
 掠	lve
 採	cai
@@ -11345,7 +11346,7 @@
 掷	zhi
 掸	dan
 掹	meng
-掺	can
+掺	chan
 掻	sao
 掼	guan
 掽	peng
@@ -11367,7 +11368,7 @@
 揍	zou
 揎	xuan
 描	miao
-提	ti
+提	di
 揑	nie
 插	cha
 揓	shi
@@ -11520,7 +11521,7 @@
 摦	hua
 摧	cui
 摨	nai
-摩	mo
+摩	ma
 摪	jiang
 摫	gui
 摬	ying
@@ -11631,7 +11632,7 @@
 擕	xie
 擖	ka
 擗	pi
-擘	bai
+擘	bo
 擙	ao
 據	ju
 擛	ye
@@ -11689,7 +11690,7 @@
 攏	long
 攐	qian
 攑	qian
-攒	zan
+攒	cuan
 攓	qian
 攔	lan
 攕	xian
@@ -11859,7 +11860,7 @@
 方	fang
 斺	chan
 斻	hang
-於	yu
+於	wu
 施	shi
 斾	pei
 斿	you
@@ -11895,7 +11896,7 @@
 旝	kuai
 旞	sui
 旟	yu
-无	wu
+无	mo
 旡	ji
 既	ji
 旣	ji
@@ -12148,7 +12149,7 @@
 曚	meng
 曛	xun
 曜	yao
-曝	pu
+曝	bao
 曞	li
 曟	chen
 曠	kuang
@@ -12207,14 +12208,14 @@
 朕	zhen
 朖	lang
 朗	lang
-朘	zui
+朘	juan
 朙	ming
 朚	huang
 望	wang
 朜	tun
 朝	chao
 朞	ji
-期	qi
+期	ji
 朠	ying
 朡	zong
 朢	wang
@@ -12235,7 +12236,7 @@
 朱	zhu
 朲	ren
 朳	ba
-朴	pu
+朴	piao
 朵	duo
 朶	duo
 朷	dao
@@ -12256,7 +12257,7 @@
 杆	gan
 杇	wu
 杈	cha
-杉	shan
+杉	sha
 杊	xun
 杋	fan
 杌	wu
@@ -12376,7 +12377,7 @@
 枾	shi
 枿	nie
 柀	bi
-柁	duo
+柁	tuo
 柂	yi
 柃	ling
 柄	bing
@@ -12430,7 +12431,7 @@
 柴	chai
 柵	shan
 柶	si
-柷	chu
+柷	zhu
 柸	pei
 柹	shi
 柺	guai
@@ -12444,7 +12445,7 @@
 栂	mei
 栃	li
 栄	rong
-栅	zha
+栅	shan
 栆	zao
 标	biao
 栈	zhan
@@ -12472,7 +12473,7 @@
 栞	kan
 栟	ben
 栠	ren
-校	xiao
+校	jiao
 栢	bai
 栣	ren
 栤	bing
@@ -12523,7 +12524,7 @@
 桑	sang
 桒	sang
 桓	huan
-桔	ju
+桔	jie
 桕	jiu
 桖	xue
 桗	duo
@@ -12552,7 +12553,7 @@
 桯	ting
 桰	kuo
 桱	jing
-桲	po
+桲	bo
 桳	ben
 桴	fu
 桵	rui
@@ -12601,7 +12602,7 @@
 梠	lv
 梡	hun
 梢	shao
-梣	cen
+梣	chen
 梤	fen
 梥	song
 梦	meng
@@ -12649,7 +12650,7 @@
 棐	fei
 棑	pai
 棒	bang
-棓	bang
+棓	bei
 棔	hun
 棕	zong
 棖	cheng
@@ -12691,7 +12692,7 @@
 棺	guan
 棻	fen
 棼	fen
-棽	shen
+棽	chen
 棾	qing
 棿	ni
 椀	wan
@@ -12800,7 +12801,7 @@
 楧	yang
 楨	zhen
 楩	pian
-楪	ye
+楪	die
 楫	ji
 楬	jie
 業	ye
@@ -12813,7 +12814,7 @@
 楴	ti
 極	ji
 楶	jie
-楷	kai
+楷	jie
 楸	qiu
 楹	ying
 楺	rou
@@ -12913,7 +12914,7 @@
 様	yang
 槙	dian
 槚	jia
-槛	kan
+槛	jian
 槜	zui
 槝	dao
 槞	long
@@ -12974,7 +12975,7 @@
 樕	su
 樖	ke
 樗	chu
-樘	tang
+樘	cheng
 標	biao
 樚	lu
 樛	jiu
@@ -13031,7 +13032,7 @@
 橎	fan
 橏	zhan
 橐	tuo
-橑	lao
+橑	liao
 橒	yun
 橓	shun
 橔	dun
@@ -13262,8 +13263,8 @@
 欵	kuan
 欶	shuo
 欷	xi
-欸	ai
-欹	yi
+欸	ei
+欹	qi
 欺	qi
 欻	chua
 欼	chi
@@ -13356,7 +13357,7 @@
 殓	lian
 殔	yi
 殕	fou
-殖	zhi
+殖	shi
 殗	ye
 殘	can
 殙	hun
@@ -13389,7 +13390,7 @@
 殴	ou
 段	duan
 殶	zhu
-殷	yin
+殷	yan
 殸	qing
 殹	yi
 殺	sha
@@ -13525,7 +13526,7 @@
 氼	ni
 氽	tun
 氾	fan
-氿	gui
+氿	jiu
 汀	ting
 汁	zhi
 求	qiu
@@ -13664,9 +13665,9 @@
 泇	jia
 泈	zhong
 泉	quan
-泊	po
+泊	bo
 泋	hui
-泌	mi
+泌	bi
 泍	ben
 泎	ze
 泏	zhu
@@ -13737,7 +13738,7 @@
 洐	xing
 洑	fu
 洒	sa
-洓	se
+洓	qi
 洔	zhi
 洕	yin
 洖	wu
@@ -13830,7 +13831,7 @@
 浭	geng
 浮	fu
 浯	wu
-浰	lian
+浰	li
 浱	chun
 浲	feng
 浳	yi
@@ -13858,7 +13859,7 @@
 涉	she
 涊	nian
 涋	tu
-涌	yong
+涌	chong
 涍	xiao
 涎	xian
 涏	ting
@@ -13879,7 +13880,7 @@
 涞	lai
 涟	lian
 涠	wei
-涡	wo
+涡	guo
 涢	yun
 涣	huan
 涤	di
@@ -13938,7 +13939,7 @@
 淙	cong
 淚	lei
 淛	zhe
-淜	ping
+淜	peng
 淝	fei
 淞	song
 淟	tian
@@ -14105,7 +14106,7 @@
 満	man
 溁	ying
 溂	la
-溃	kui
+溃	hui
 溄	feng
 溅	jian
 溆	xu
@@ -14128,7 +14129,7 @@
 溗	cheng
 溘	ke
 溙	tai
-溚	ta
+溚	da
 溛	wa
 溜	liu
 溝	gou
@@ -14205,7 +14206,7 @@
 滤	lv
 滥	lan
 滦	luan
-滧	yao
+滧	xiao
 滨	bin
 滩	tan
 滪	yu
@@ -14282,7 +14283,7 @@
 漱	shu
 漲	zhang
 漳	zhang
-漴	zhuang
+漴	chong
 漵	xu
 漶	huan
 漷	huo
@@ -14332,7 +14333,7 @@
 潣	min
 潤	run
 潥	su
-潦	lao
+潦	liao
 潧	zhen
 潨	cong
 潩	yi
@@ -14503,7 +14504,7 @@
 瀎	mo
 瀏	liu
 瀐	jian
-瀑	pu
+瀑	bao
 瀒	se
 瀓	cheng
 瀔	gu
@@ -14619,7 +14620,7 @@
 炂	zhong
 炃	fen
 炄	niu
-炅	jiong
+炅	gui
 炆	wen
 炇	pu
 炈	yi
@@ -14634,7 +14635,7 @@
 炑	mu
 炒	chao
 炓	liao
-炔	gui
+炔	que
 炕	kang
 炖	dun
 炗	guang
@@ -14660,7 +14661,7 @@
 炫	xuan
 炬	ju
 炭	tan
-炮	pao
+炮	bao
 炯	jiong
 炰	pao
 炱	tai
@@ -14736,7 +14737,7 @@
 烸	hai
 烹	peng
 烺	lang
-烻	yan
+烻	shan
 烼	xu
 烽	feng
 烾	chi
@@ -14765,7 +14766,7 @@
 焕	huan
 焖	men
 焗	ju
-焘	dao
+焘	tao
 焙	bei
 焚	fen
 焛	lin
@@ -14900,7 +14901,7 @@
 熜	cong
 熝	lu
 熞	jian
-熟	shu
+熟	shou
 熠	yi
 熡	lou
 熢	peng
@@ -14909,7 +14910,7 @@
 熥	teng
 熦	jue
 熧	zong
-熨	yun
+熨	yu
 熩	hu
 熪	yi
 熫	zhi
@@ -15407,7 +15408,7 @@
 玗	yu
 玘	qi
 玙	yu
-玚	chang
+玚	yang
 玛	ma
 玜	hong
 玝	wu
@@ -15486,7 +15487,7 @@
 珦	xiang
 珧	yao
 珨	xia
-珩	hang
+珩	heng
 珪	gui
 珫	chong
 珬	xu
@@ -15543,7 +15544,7 @@
 琟	wei
 琠	tian
 琡	chu
-琢	zuo
+琢	zhuo
 琣	beng
 琤	cheng
 琥	hu
@@ -15622,7 +15623,7 @@
 瑮	li
 瑯	lang
 瑰	gui
-瑱	zhen
+瑱	tian
 瑲	qiang
 瑳	cuo
 瑴	jue
@@ -15818,7 +15819,7 @@
 男	nan
 甸	dian
 甹	ping
-町	ting
+町	ding
 画	hua
 甼	ting
 甽	zhen
@@ -15868,7 +15869,7 @@
 畩	yi
 番	fan
 畫	hua
-畬	she
+畬	yu
 畭	yu
 畮	mu
 畯	jun
@@ -16143,7 +16144,7 @@
 發	fa
 白	bai
 百	bai
-癿	qie
+癿	bie
 皀	ji
 皁	zao
 皂	zao
@@ -16235,7 +16236,7 @@
 盘	pan
 盙	fu
 盚	qiu
-盛	sheng
+盛	cheng
 盜	dao
 盝	lu
 盞	zhan
@@ -16336,7 +16337,7 @@
 眽	mo
 眾	zhong
 眿	mo
-着	zhe
+着	zhao
 睁	zheng
 睂	mei
 睃	suo
@@ -16515,7 +16516,7 @@
 矰	zeng
 矱	yue
 矲	ba
-石	shi
+石	dan
 矴	ding
 矵	qi
 矶	ji
@@ -16537,7 +16538,7 @@
 砆	fu
 砇	min
 砈	e
-砉	huo
+砉	hua
 砊	kang
 砋	zhi
 砌	qi
@@ -16602,17 +16603,17 @@
 硇	nao
 硈	qia
 硉	lu
-硊	wei
+硊	hui
 硋	ai
 硌	ge
-硍	xian
+硍	yin
 硎	xing
 硏	yan
 硐	dong
 硑	peng
 硒	xi
 硓	lao
-硔	hong
+硔	gong
 硕	shuo
 硖	xia
 硗	qiao
@@ -16664,11 +16665,11 @@
 碅	jun
 碆	bo
 碇	ding
-碈	min
+碈	hun
 碉	diao
 碊	jian
 碋	he
-碌	lu
+碌	liu
 碍	ai
 碎	sui
 碏	que
@@ -16689,7 +16690,7 @@
 碞	yan
 碟	die
 碠	ding
-碡	du
+碡	zhou
 碢	tuo
 碣	jie
 碤	ying
@@ -16735,7 +16736,7 @@
 磌	tian
 磍	xia
 磎	xi
-磏	lian
+磏	qian
 磐	pan
 磑	wei
 磒	yun
@@ -16989,7 +16990,7 @@
 秊	nian
 秋	qiu
 秌	qiu
-种	zhong
+种	chong
 秎	fen
 秏	hao
 秐	yun
@@ -17000,7 +17001,7 @@
 秕	bi
 秖	zhi
 秗	yu
-秘	mi
+秘	bi
 秙	ku
 秚	ban
 秛	pi
@@ -17024,7 +17025,7 @@
 秭	zi
 秮	huo
 积	ji
-称	cheng
+称	chen
 秱	tong
 秲	zhi
 秳	huo
@@ -17132,7 +17133,7 @@
 穙	pu
 穚	jiao
 穛	zhuo
-穜	zhong
+穜	tong
 穝	zui
 穞	lv
 穟	sui
@@ -17392,7 +17393,7 @@
 筝	zheng
 筞	ce
 筟	fu
-筠	yun
+筠	jun
 筡	tu
 筢	pa
 筣	li
@@ -17704,7 +17705,7 @@
 粕	po
 粖	mo
 粗	cu
-粘	zhan
+粘	nian
 粙	zhou
 粚	chi
 粛	su
@@ -17772,7 +17773,7 @@
 糙	cao
 糚	zhuang
 糛	tang
-糜	mi
+糜	mei
 糝	san
 糞	fen
 糟	zao
@@ -17803,7 +17804,7 @@
 糸	mi
 糹	si
 糺	jiu
-系	xi
+系	ji
 糼	gong
 糽	zheng
 糾	jiu
@@ -17982,7 +17983,7 @@
 綫	xian
 綬	shou
 維	wei
-綮	qi
+綮	qing
 綯	tao
 綰	wan
 綱	gang
@@ -18228,9 +18229,9 @@
 纡	yu
 红	hong
 纣	zhou
-纤	xian
-纥	ge
-约	yue
+纤	qian
+纥	he
+约	yao
 级	ji
 纨	wan
 纩	kuang
@@ -18246,7 +18247,7 @@
 纳	na
 纴	ren
 纵	zong
-纶	lun
+纶	guan
 纷	fen
 纸	zhi
 纹	wen
@@ -18284,7 +18285,7 @@
 给	gei
 绚	xuan
 绛	jiang
-络	luo
+络	lao
 绝	jue
 绞	jiao
 统	tong
@@ -18304,7 +18305,7 @@
 续	xu
 绮	qi
 绯	fei
-绰	chuo
+绰	chao
 绱	shang
 绲	gun
 绳	sheng
@@ -18316,10 +18317,10 @@
 绹	tao
 绺	liu
 绻	quan
-综	zong
+综	zeng
 绽	zhan
 绾	wan
-绿	lv
+绿	lu
 缀	zhui
 缁	zi
 缂	ke
@@ -18361,8 +18362,8 @@
 缦	man
 缧	lei
 缨	ying
-缩	suo
-缪	mou
+缩	su
+缪	miao
 缫	sao
 缬	xie
 缭	liao
@@ -18591,7 +18592,7 @@
 而	er
 耍	shua
 耎	ruan
-耏	nai
+耏	er
 耐	nai
 耑	duan
 耒	lei
@@ -18658,7 +18659,7 @@
 聏	er
 聐	ya
 聑	tie
-聒	gua
+聒	guo
 聓	xu
 联	lian
 聕	hao
@@ -18715,7 +18716,7 @@
 肈	zhao
 肉	rou
 肊	yi
-肋	le
+肋	lei
 肌	ji
 肍	qiu
 肎	ken
@@ -18754,7 +18755,7 @@
 肯	ken
 肰	ran
 肱	gong
-育	yu
+育	yo
 肳	wen
 肴	yao
 肵	qi
@@ -18790,7 +18791,7 @@
 胓	ping
 胔	zi
 胕	fu
-胖	pang
+胖	pan
 胗	zhen
 胘	xian
 胙	zuo
@@ -18879,7 +18880,7 @@
 脬	pao
 脭	cheng
 脮	nei
-脯	pu
+脯	fu
 脰	dou
 脱	tuo
 脲	niao
@@ -18908,7 +18909,7 @@
 腉	nai
 腊	la
 腋	ye
-腌	yan
+腌	a
 腍	ren
 腎	shen
 腏	chuo
@@ -19019,14 +19020,14 @@
 膸	sui
 膹	fen
 膺	ying
-膻	shan
+膻	dan
 膼	zhua
 膽	dan
 膾	kuai
 膿	nong
 臀	tun
 臁	lian
-臂	bi
+臂	bei
 臃	yong
 臄	jue
 臅	chu
@@ -19204,7 +19205,7 @@
 艱	jian
 色	se
 艳	yan
-艴	fu
+艴	bo
 艵	ping
 艶	yan
 艷	yan
@@ -19230,17 +19231,17 @@
 芋	yu
 芌	yu
 芍	shao
-芎	qiong
+芎	xiong
 芏	du
 芐	hu
 芑	qi
 芒	mang
 芓	zi
-芔	hui
+芔	cao
 芕	sui
 芖	zhi
 芗	xiang
-芘	pi
+芘	bi
 芙	fu
 芚	tun
 芛	wei
@@ -19355,7 +19356,7 @@
 茈	ci
 茉	mo
 茊	zi
-茋	zhi
+茋	di
 茌	chi
 茍	ji
 茎	jing
@@ -19448,7 +19449,7 @@
 荥	xing
 荦	luo
 荧	ying
-荨	xun
+荨	qian
 荩	jin
 荪	sun
 荫	yin
@@ -19593,7 +19594,7 @@
 菶	beng
 菷	zhou
 菸	yan
-菹	ju
+菹	zu
 菺	jian
 菻	lin
 菼	tan
@@ -19661,7 +19662,7 @@
 萺	mao
 萻	an
 萼	e
-落	luo
+落	la
 萾	ying
 萿	kuo
 葀	kuo
@@ -19712,7 +19713,7 @@
 葭	jia
 葮	duan
 葯	yao
-葰	sui
+葰	jun
 葱	cong
 葲	quan
 葳	wei
@@ -19794,7 +19795,7 @@
 蒿	hao
 蓀	sun
 蓁	zhen
-蓂	ming
+蓂	mi
 蓃	sou
 蓄	xu
 蓅	liu
@@ -19864,7 +19865,7 @@
 蔅	yan
 蔆	ling
 蔇	ji
-蔈	biao
+蔈	piao
 蔉	gun
 蔊	han
 蔋	di
@@ -19923,7 +19924,7 @@
 蕀	ji
 蕁	qian
 蕂	sheng
-蕃	fan
+蕃	bo
 蕄	meng
 蕅	ou
 蕆	chan
@@ -19985,7 +19986,7 @@
 蕾	lei
 蕿	xuan
 薀	yun
-薁	yu
+薁	ao
 薂	xi
 薃	hao
 薄	bao
@@ -20231,7 +20232,7 @@
 虴	zhe
 虵	she
 虶	yu
-虷	han
+虷	gan
 虸	zi
 虹	hong
 虺	hui
@@ -20340,7 +20341,7 @@
 蛡	yi
 蛢	ping
 蛣	qi
-蛤	ha
+蛤	ge
 蛥	she
 蛦	yi
 蛧	wang
@@ -20531,7 +20532,7 @@
 螠	yi
 螡	wen
 螢	ying
-螣	te
+螣	teng
 螤	zhong
 螥	cang
 螦	sao
@@ -20688,7 +20689,7 @@
 蠽	jie
 蠾	zhu
 蠿	zhuo
-血	xue
+血	xie
 衁	huang
 衂	nv
 衃	pei
@@ -20700,7 +20701,7 @@
 衉	ka
 衊	mie
 衋	xi
-行	xing
+行	hang
 衍	yan
 衎	kan
 衏	yuan
@@ -20807,7 +20808,7 @@
 袴	ku
 袵	ren
 袶	jiang
-袷	jia
+袷	qia
 袸	jian
 袹	bo
 袺	jie
@@ -20867,7 +20868,7 @@
 裰	duo
 裱	biao
 裲	liang
-裳	shang
+裳	chang
 裴	pei
 裵	pei
 裶	fei
@@ -21011,7 +21012,7 @@
 覀	xi
 要	yao
 覂	feng
-覃	tan
+覃	qin
 覄	fu
 覅	fiao
 覆	fu
@@ -21081,7 +21082,7 @@
 视	shi
 觇	chan
 览	lan
-觉	jue
+觉	jiao
 觊	ji
 觋	xi
 觌	di
@@ -21608,7 +21609,7 @@
 试	shi
 诖	gua
 诗	shi
-诘	ji
+诘	jie
 诙	hui
 诚	cheng
 诛	zhu
@@ -21636,20 +21637,20 @@
 诱	you
 诲	hui
 诳	kuang
-说	shuo
+说	shui
 诵	song
 诶	ei
 请	qing
 诸	zhu
 诹	zou
 诺	nuo
-读	du
+读	dou
 诼	zhuo
 诽	fei
 课	ke
 诿	wei
 谀	yu
-谁	shui
+谁	shei
 谂	shen
 调	diao
 谄	chan
@@ -21721,7 +21722,7 @@
 豆	dou
 豇	jiang
 豈	qi
-豉	shi
+豉	chi
 豊	li
 豋	deng
 豌	wan
@@ -21768,7 +21769,7 @@
 豵	zong
 豶	fen
 豷	yi
-豸	zhi
+豸	zhai
 豹	bao
 豺	chai
 豻	an
@@ -21966,7 +21967,7 @@
 贻	yi
 贼	zei
 贽	zhi
-贾	jia
+贾	gu
 贿	hui
 赀	zi
 赁	lin
@@ -22362,7 +22363,7 @@
 軇	dao
 軈	ying
 軉	yu
-車	che
+車	ju
 軋	ya
 軌	gui
 軍	jun
@@ -22519,7 +22520,7 @@
 轤	lu
 轥	lin
 车	che
-轧	ya
+轧	ga
 轨	gui
 轩	xuan
 轪	dai
@@ -22567,7 +22568,7 @@
 辔	pei
 辕	yuan
 辖	xia
-辗	nian
+辗	zhan
 辘	lu
 辙	zhe
 辚	lin
@@ -22575,7 +22576,7 @@
 辜	gu
 辝	ci
 辞	ci
-辟	pi
+辟	bi
 辠	zui
 辡	bian
 辢	la
@@ -22633,7 +22634,7 @@
 迖	da
 迗	e
 还	hai
-这	zhe
+这	zhei
 迚	da
 进	jin
 远	yuan
@@ -22651,7 +22652,7 @@
 迨	dai
 迩	er
 迪	di
-迫	po
+迫	pai
 迬	zhu
 迭	die
 迮	ze
@@ -22674,7 +22675,7 @@
 迿	xun
 退	tui
 送	song
-适	shi
+适	kuo
 逃	tao
 逄	pang
 逅	hou
@@ -22759,7 +22760,7 @@
 達	da
 違	wei
 遖	nan
-遗	yi
+遗	wei
 遘	gou
 遙	yao
 遚	chou
@@ -22994,7 +22995,7 @@
 鄿	ji
 酀	yan
 酁	chan
-酂	cuo
+酂	zan
 酃	ling
 酄	huan
 酅	xi
@@ -23054,7 +23055,7 @@
 酻	zui
 酼	hai
 酽	yan
-酾	shai
+酾	shi
 酿	niang
 醀	wei
 醁	lu
@@ -23133,10 +23134,10 @@
 释	shi
 釋	shi
 里	li
-重	zhong
+重	chong
 野	ye
 量	liang
-釐	li
+釐	xi
 金	jin
 釒	jin
 釓	ga
@@ -23382,7 +23383,7 @@
 鋃	lang
 鋄	wan
 鋅	xin
-鋆	yun
+鋆	jun
 鋇	bei
 鋈	wu
 鋉	su
@@ -23869,7 +23870,7 @@
 钪	kang
 钫	fang
 钬	huo
-钭	tou
+钭	dou
 钮	niu
 钯	ba
 钰	yu
@@ -23915,7 +23916,7 @@
 铘	ye
 铙	nao
 铚	zhi
-铛	dang
+铛	cheng
 铜	tong
 铝	lv
 铞	diao
@@ -23924,7 +23925,7 @@
 铡	zha
 铢	zhu
 铣	xi
-铤	ding
+铤	ting
 铥	diu
 铦	xian
 铧	hua
@@ -24054,7 +24055,7 @@
 镣	liao
 镤	pu
 镥	lu
-镦	dui
+镦	dun
 镧	lan
 镨	pu
 镩	cuan
@@ -24079,7 +24080,7 @@
 镼	qu
 镽	liao
 镾	mi
-长	zhang
+长	chang
 門	men
 閁	ma
 閂	shuan
@@ -24232,9 +24233,9 @@
 阕	que
 阖	he
 阗	tian
-阘	da
+阘	ta
 阙	que
-阚	han
+阚	kan
 阛	huan
 阜	fu
 阝	fu
@@ -24278,7 +24279,7 @@
 陃	bing
 附	fu
 际	ji
-陆	lu
+陆	liu
 陇	long
 陈	chen
 陉	xing
@@ -24359,7 +24360,7 @@
 隔	ge
 隕	yun
 隖	wu
-隗	kui
+隗	wei
 隘	ai
 隙	xi
 隚	tang
@@ -24394,13 +24395,13 @@
 隷	li
 隸	li
 隹	zhui
-隺	hu
+隺	he
 隻	zhi
 隼	sun
 隽	juan
 难	nan
 隿	yi
-雀	que
+雀	qiao
 雁	yan
 雂	qin
 雃	qian
@@ -24443,7 +24444,7 @@
 雨	yu
 雩	yu
 雪	xue
-雫	na
+雫	xia
 雬	fou
 雭	se
 雮	mu
@@ -24514,7 +24515,7 @@
 霯	teng
 霰	xian
 霱	yu
-露	lu
+露	lou
 霳	long
 霴	dai
 霵	ji
@@ -24856,7 +24857,7 @@
 颅	lu
 领	ling
 颇	po
-颈	jing
+颈	geng
 颉	jie
 颊	jia
 颋	ting
@@ -25079,7 +25080,7 @@
 饤	ding
 饥	ji
 饦	tuo
-饧	tang
+饧	xing
 饨	tun
 饩	xi
 饪	ren
@@ -25097,7 +25098,7 @@
 饶	rao
 饷	xiang
 饸	he
-饹	le
+饹	ge
 饺	jiao
 饻	xi
 饼	bing
@@ -25342,7 +25343,7 @@
 驫	biao
 马	ma
 驭	yu
-驮	tuo
+驮	duo
 驯	xun
 驰	chi
 驱	qu
@@ -25884,7 +25885,7 @@
 鲉	you
 鲊	zha
 鲋	fu
-鲌	ba
+鲌	bo
 鲍	bao
 鲎	hou
 鲏	pi
@@ -26447,7 +26448,7 @@
 麼	me
 麽	mo
 麾	hui
-麿	mi
+麿	mo
 黀	zou
 黁	nun
 黂	fen
@@ -26592,7 +26593,7 @@
 齍	zi
 齎	ji
 齏	ji
-齐	qi
+齐	ji
 齑	ji
 齒	chi
 齓	chen
@@ -26648,7 +26649,7 @@
 龅	bao
 龆	tiao
 龇	zi
-龈	ken
+龈	yin
 龉	yu
 龊	chuo
 龋	qu
@@ -26688,7 +26689,7 @@
 鿇	zheng
 鿌	liang
 鿍	gang
-鿎	ta
+鿎	da
 鿏	mai
 鿔	ge
 鿕	dan
@@ -34948,7 +34949,7 @@
 𦝳	xu
 𦝴	yin
 𦝷	beng
-𦝼	lv
+𦝼	lou
 𦞁	zai
 𦞂	da
 𦞆	nie
@@ -40617,12 +40618,15 @@
 𩿬	you
 𩿷	ti
 𩿺	wa
+𩿼	ya
 𩿽	tuo
 𩿿	chu
 𪀁	ge
 𪀈	yuan
 𪀉	ge
 𪀊	qu
+𪀋	ya
+𪀌	ya
 𪀏	ju
 𪀒	die
 𪀓	yi
@@ -40845,6 +40849,7 @@
 𪈊	he
 𪈋	tuan
 𪈑	hui
+𪈗	long
 𪈘	hong
 𪈜	lv
 𪈟	jia
@@ -41323,6 +41328,7 @@
 𪘀	pian
 𪘁	ta
 𪘃	yi
+𪘅	nie
 𪘆	xiu
 𪘇	zhai
 𪘉	duo
