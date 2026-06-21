@@ -65,16 +65,18 @@ Built entirely from **freely-available, GitHub-hosted** sources (see `data/meta.
 
 - **Lexicon** — hand-curated [`iDvel/rime-ice`](https://github.com/iDvel/rime-ice) dictionaries
   (≈700k words with **correct polyphone readings** and real frequencies), `rime/rime-essay`
-  frequencies, and jieba for coverage back-fill. This is the key quality lever: per-character
-  pinyin composition mangles polyphones (银行→`yinhang` not `yinxing`); rime-ice fixes it.
+  frequencies, and jieba for coverage back-fill. Surfaces are normalized **Traditional→Simplified**
+  (OpenCC `TSPhrases`/`TSCharacters`) with frequency-merging + dedup, so traditional variants never
+  compete with their simplified forms. This is the key quality lever: per-character pinyin
+  composition mangles polyphones (银行→`yinhang` not `yinxing`); rime-ice fixes it.
 - **Language model** — a word **trigram** built from a general-domain news-title corpus
   (Toutiao, ~2.1M segments) unioned with shopping reviews, tokenized by longest-match over the
   lexicon, smoothed with absolute-discounting interpolation.
 - **English** — a frequency-ranked list (`google-10000-english` ∪ `dwyl/english-words`, 60k).
 
-Counts: ~700k words / ~471k readings / ~737k bigrams / ~725k trigrams / 60k English.
+Counts: ~700k words / ~583k readings / ~734k bigrams / ~49k trigrams / 60k English.
 
-**Footprint:** release binary **~3 MB** + `data/` **~45 MB** = **~48 MB total**, well under the
+**Footprint:** release binary **~3 MB** + `data/` **~49 MB** = **~52 MB total**, well under the
 100 MB budget (data is mmap'd separately, not embedded).
 
 ## Build & run
@@ -123,17 +125,17 @@ and on-disk data size. Output is a human-readable table **and** `report.json`.
 ```
 bucket              n    top1    top5   top10     mrr char_acc     cer coverage
 -------------------------------------------------------------------------------
-full              600   0.612   0.807   0.855   0.701    0.897   0.103    0.867
-abbr              599   0.087   0.217   0.297   0.149    0.136   0.864    0.377
-fuzzy             600   0.518   0.695   0.745   0.596    0.857   0.143    0.773
-typo              600   0.333   0.453   0.487   0.380    0.754   0.246    0.517
+full              600   0.613   0.820   0.862   0.705    0.896   0.104    0.875
+abbr              599   0.092   0.235   0.307   0.155    0.145   0.855    0.387
+fuzzy             600   0.510   0.713   0.768   0.600    0.857   0.143    0.803
+typo              600   0.323   0.445   0.477   0.370    0.753   0.247    0.513
 english            40   1.000   1.000   1.000   1.000    1.000   0.000    1.000
-mixed             257   0.681   0.802   0.829   0.733    0.889   0.111    0.840
-long_sentence     600   0.580   0.770   0.818   0.666    0.913   0.087    0.835
-short_word        111   0.748   0.937   0.982   0.830    0.815   0.185    0.982
+mixed             257   0.658   0.802   0.829   0.720    0.885   0.115    0.837
+long_sentence     600   0.583   0.792   0.833   0.674    0.913   0.087    0.848
+short_word        111   0.748   0.937   0.982   0.827    0.811   0.189    0.982
 -------------------------------------------------------------------------------
-OVERALL          3407   0.463   0.621   0.670   0.533    0.732   0.268    0.700
-Latency: p50 8.4ms  p95 21.7ms   |   RSS 37 MiB   |   data 45.7 MiB
+OVERALL          3407   0.459   0.632   0.678   0.534    0.732   0.268    0.710
+Latency: p50 7.5ms  p95 18.1ms   |   RSS 37 MiB   |   data 49 MiB
 ```
 
 ### How it got there — quantified improvement per stage
@@ -150,7 +152,8 @@ The engine was tuned **using the eval harness as the objective function**. OVERA
 | **rime-ice lexicon** | 0.275 | 0.458 | 0.553 | 0.408 | correct readings |
 | **smoothed trigram LM** | 0.414 | 0.620 | 0.695 | 0.610 | the big lever |
 | **literal-demotion** | 0.460 | 0.620 | 0.695 | 0.612 | typo 0.10→0.33 |
-| **简拼 word-boost** | **0.463** | **0.621** | **0.698** | **0.612** | kyi→可以, bj→北京 #1 |
+| **简拼 word-boost** | 0.463 | 0.621 | 0.698 | 0.612 | kyi→可以, bj→北京 #1 |
+| **繁→简归一化** | **0.459** | **0.632** | **0.710** | **0.613** | OpenCC T2S; top5/coverage up |
 
 The two dominant levers were the **curated lexicon** (correct readings) and the **smoothed
 trigram LM** — exactly as in commercial systems. On the controlled A/B over the 980 sentences

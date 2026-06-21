@@ -1,10 +1,10 @@
 {
-  "bytes_total": 47322471,
+  "bytes_total": 50543173,
   "log_base": 500.0,
-  "num_bigrams": 736851,
-  "num_readings": 471331,
-  "num_trigrams": 53126,
+  "num_bigrams": 733555,
+  "num_readings": 583358,
+  "num_trigrams": 48901,
   "num_words": 700000,
-  "source_notes": "rime-ice(base/8105/41448/others/tencent) + rime-essay + jieba-dict back-fill + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words + google-10000-english + toutiao-news-titles + online-shopping; rime-ice-base=ok, rime-ice-8105=ok, rime-ice-41448=ok, rime-ice-others=ok, rime-ice-tencent=ok, rime-essay=ok, general-corpus=toutiao_news_titles, sentence-corpus=online_shopping_10_cats, lexicon: rime-words=596848, freq-supp=114804, jieba-backfill=151410, english=60000",
+  "source_notes": "rime-ice(base/8105/41448/others/tencent) + rime-essay + jieba-dict back-fill + mozillazg/pinyin-data + phrase-pinyin-data + dwyl/english-words + google-10000-english + toutiao-news-titles + online-shopping; rime-ice-base=ok, rime-ice-8105=ok, rime-ice-41448=ok, rime-ice-others=ok, rime-ice-tencent=ok, rime-essay=ok, opencc-TSCharacters=ok, opencc-TSPhrases=ok, opencc-mappings=3570, general-corpus=toutiao_news_titles, sentence-corpus=online_shopping_10_cats, lexicon: rime-words=596848, freq-supp=316107, jieba-backfill=150908, t2s-normalized=296324, english=60000",
   "version": 1
 }

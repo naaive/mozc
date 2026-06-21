@@ -190,6 +190,26 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
         "rime-essay",
     );
 
+    // OpenCC Traditional→Simplified mappings (PRIMARY normalization source).
+    // Phrase map applied before char map at ingestion time so 繁体 surfaces
+    // collapse onto their 简体 canonical form. Best-effort: an empty map degrades
+    // to identity and the build still succeeds.
+    let opencc_chars_raw = try_cached(
+        "opencc-TSCharacters.txt",
+        "https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary/TSCharacters.txt",
+        &mut notes,
+        "opencc-TSCharacters",
+    );
+    let opencc_phrases_raw = try_cached(
+        "opencc-TSPhrases.txt",
+        "https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary/TSPhrases.txt",
+        &mut notes,
+        "opencc-TSPhrases",
+    );
+    let opencc = pinyin::OpenCc::from_raw(&opencc_chars_raw, &opencc_phrases_raw);
+    eprintln!("  OpenCC Traditional->Simplified mappings: {}", opencc.len());
+    notes.push(format!("opencc-mappings={}", opencc.len()));
+
     let english_raw = read_cached(
         "english-words.txt",
         "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt",
@@ -291,6 +311,7 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
         &jieba_raw,
         &hanzi,
         &phrases,
+        &opencc,
         &mut notes,
     )?;
     eprintln!(
@@ -311,6 +332,7 @@ pub fn build_all_opts(out_dir: &Path, corpus_dir: &Path, offline: bool) -> Resul
     let (num_bigrams, num_trigrams, heldout) = build_and_write_ngrams(
         out_dir,
         &words,
+        &opencc,
         corpus_toutiao.as_deref(),
         corpus_csv.as_deref(),
     )?;
@@ -449,8 +471,25 @@ fn build_words(
     jieba_raw: &[u8],
     hanzi: &pinyin::HanziTable,
     phrases: &FxHashMap<String, Vec<String>>,
+    opencc: &pinyin::OpenCc,
     notes: &mut Vec<String>,
 ) -> Result<WordSet> {
+    // Normalize a raw lexicon surface to Simplified (phrase-then-char). When a
+    // traditional surface collapses onto a simplified one with the SAME reading,
+    // it merges into the same (surface, reading) bucket below, summing its weight
+    // into the simplified entry; the traditional surface disappears entirely.
+    // Count how many surfaces actually changed for the build report.
+    let mut t2s_changed = 0u64;
+    let normalize_surface = |surface: &str, t2s_changed: &mut u64| -> String {
+        if opencc.is_empty() {
+            return surface.to_string();
+        }
+        let simp = opencc.convert(surface);
+        if simp != surface {
+            *t2s_changed += 1;
+        }
+        simp
+    };
     // Merged store keyed by (surface, reading) → (freq, pos).
     // rime-ice readings are authoritative; freqs are merged additively across
     // rime-ice base, others, tencent (freq-only), essay (freq-only).
@@ -491,11 +530,13 @@ fn build_words(
     for raw in rime_word_sources {
         for_each_rime_word_entry(raw, |word, reading, weight| {
             rime_word_lines += 1;
+            // T→S normalize the surface; the reading is shared by 繁/简 and stays.
+            let surface = normalize_surface(word, &mut t2s_changed);
             insert_reading(
                 &mut merged,
                 &mut rime_surfaces,
                 &mut best_reading_for_surface,
-                word,
+                &surface,
                 reading,
                 weight as f64,
             );
@@ -508,24 +549,21 @@ fn build_words(
     //     (rime-corrected) hanzi table so the word still gets a usable entry.
     let mut freq_supp_applied = 0u64;
     let mut freq_supp_composed = 0u64;
-    let mut apply_freq = |surface: &str, weight: u64| {
-        if let Some((reading, _)) = best_reading_for_surface.get(surface).cloned() {
-            let e = merged
-                .entry((surface.to_string(), reading))
-                .or_insert((0.0, 0));
+    let mut apply_freq = |surface_raw: &str, weight: u64, t2s_changed: &mut u64| {
+        let surface = normalize_surface(surface_raw, t2s_changed);
+        if let Some((reading, _)) = best_reading_for_surface.get(&surface).cloned() {
+            let e = merged.entry((surface, reading)).or_insert((0.0, 0));
             e.0 += weight as f64;
             freq_supp_applied += 1;
-        } else if let Some(reading) = pinyin::word_to_key(surface, hanzi, phrases) {
+        } else if let Some(reading) = pinyin::word_to_key(&surface, hanzi, phrases) {
             // compose a reading (correctness still benefits from rime-corrected hanzi)
-            let e = merged
-                .entry((surface.to_string(), reading))
-                .or_insert((0.0, 0));
+            let e = merged.entry((surface, reading)).or_insert((0.0, 0));
             e.0 += weight as f64;
             freq_supp_composed += 1;
         }
     };
-    for_each_freq_entry(rime_tencent_raw, |w, wt| apply_freq(w, wt));
-    for_each_freq_entry(essay_raw, |w, wt| apply_freq(w, wt));
+    for_each_freq_entry(rime_tencent_raw, |w, wt| apply_freq(w, wt, &mut t2s_changed));
+    for_each_freq_entry(essay_raw, |w, wt| apply_freq(w, wt, &mut t2s_changed));
     eprintln!(
         "  freq-supplement entries applied: {freq_supp_applied} (composed-reading: {freq_supp_composed})"
     );
@@ -543,32 +581,37 @@ fn build_words(
             continue;
         }
         let mut it = line.split_whitespace();
-        let surface = match it.next() {
+        let surface_raw = match it.next() {
             Some(s) => s,
             None => continue,
         };
         let freq: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let pos_str = it.next().unwrap_or("");
-        if freq == 0 || !pinyin::is_all_cjk(surface) {
+        if freq == 0 || !pinyin::is_all_cjk(surface_raw) {
             continue;
         }
-        if rime_surfaces.contains_key(surface) {
+        // T→S normalize before the rime-conflict check and reading composition so
+        // a traditional jieba surface either merges into its existing simplified
+        // rime entry or composes a (simplified) reading correctly.
+        let surface = normalize_surface(surface_raw, &mut t2s_changed);
+        if rime_surfaces.contains_key(&surface) {
             continue; // rime-ice wins on conflict
         }
-        let reading = match pinyin::word_to_key(surface, hanzi, phrases) {
+        let reading = match pinyin::word_to_key(&surface, hanzi, phrases) {
             Some(k) => k,
             None => continue,
         };
         let e = merged
-            .entry((surface.to_string(), reading))
+            .entry((surface.clone(), reading))
             .or_insert((0.0, 0));
         e.0 += freq as f64;
         e.1 = pinyin::pos_tag(pos_str);
         jieba_added += 1;
     }
     eprintln!("  jieba back-fill (surfaces not in rime-ice): {jieba_added}");
+    eprintln!("  T->S normalized surfaces (繁→简 collapses, merged): {t2s_changed}");
     notes.push(format!(
-        "lexicon: rime-words={rime_word_lines}, freq-supp={freq_supp_applied}, jieba-backfill={jieba_added}"
+        "lexicon: rime-words={rime_word_lines}, freq-supp={freq_supp_applied}, jieba-backfill={jieba_added}, t2s-normalized={t2s_changed}"
     ));
 
     // --- materialize: assign ids, compute unigram cost from merged freq ------
@@ -687,10 +730,21 @@ fn write_word_pinyin_tsv(out_dir: &Path, words: &WordSet) -> Result<()> {
 fn build_and_write_ngrams(
     out_dir: &Path,
     words: &WordSet,
+    opencc: &pinyin::OpenCc,
     corpus_toutiao: Option<&Path>,
     corpus_csv: Option<&Path>,
 ) -> Result<(u64, u64, Vec<String>)> {
     let seg = Segmenter::new(&words.surface_to_id);
+    // Normalize corpus text to Simplified before segmentation so any traditional
+    // text in the corpora maps onto the (simplified) vocabulary, instead of failing
+    // to segment. Identity when OpenCC is unavailable.
+    let t2s = |s: &str| -> String {
+        if opencc.is_empty() {
+            s.to_string()
+        } else {
+            opencc.convert(s)
+        }
+    };
 
     let mut uni_counts: FxHashMap<u32, u32> = FxHashMap::default();
     let mut bi_counts: FxHashMap<(u32, u32), u32> = FxHashMap::default();
@@ -722,7 +776,8 @@ fn build_and_write_ngrams(
         let sentences = read_toutiao_sentences(tt_path)?;
         eprintln!("  general (toutiao) sentences: {}", sentences.len());
         for s in &sentences {
-            count_sentence(s, 1, &mut uni_counts, &mut bi_counts, &mut tri_counts);
+            let s = t2s(s);
+            count_sentence(&s, 1, &mut uni_counts, &mut bi_counts, &mut tri_counts);
         }
         used_corpus = true;
     }
@@ -734,14 +789,17 @@ fn build_and_write_ngrams(
         let n = sentences.len();
         let split = n.saturating_sub(HELDOUT_SENTENCES);
         for (i, s) in sentences.iter().enumerate() {
+            // Normalize to Simplified so both the LM counts and the held-out eval
+            // sentences are over the (simplified) vocabulary.
+            let s = t2s(s);
             if i >= split {
                 if heldout.len() < HELDOUT_SENTENCES {
-                    heldout.push(s.clone());
+                    heldout.push(s);
                 }
                 continue;
             }
             count_sentence(
-                s,
+                &s,
                 SHOPPING_WEIGHT,
                 &mut uni_counts,
                 &mut bi_counts,
@@ -1274,6 +1332,25 @@ mod tests {
         assert_eq!(pinyin::normalize_syllable("lǜ"), "lv");
         assert_eq!(pinyin::normalize_syllable("hǎo"), "hao");
         assert_eq!(pinyin::normalize_syllable("zhong4"), "zhong");
+    }
+
+    #[test]
+    fn opencc_traditional_to_simplified() {
+        // char-level: trad -> simp; phrase-level applied first.
+        let chars = "這\t这\n個\t个\n中\t中\n國\t国\n了\t了\n".as_bytes();
+        // phrase that overrides a naive char mapping (不瞭解 -> 不了解).
+        let phrases = "不瞭解\t不了解\n".as_bytes();
+        let cc = pinyin::OpenCc::from_raw(chars, phrases);
+        assert_eq!(cc.convert("這個"), "这个");
+        assert_eq!(cc.convert("中國"), "中国");
+        // already simplified -> unchanged
+        assert_eq!(cc.convert("这个"), "这个");
+        // phrase wins over per-char
+        assert_eq!(cc.convert("不瞭解"), "不了解");
+        // mixed / passthrough non-mapped chars
+        assert_eq!(cc.convert("a這b"), "a这b");
+        // self-mapping entries are dropped (中->中 not stored) but identity holds
+        assert!(!cc.is_empty());
     }
 
     #[test]

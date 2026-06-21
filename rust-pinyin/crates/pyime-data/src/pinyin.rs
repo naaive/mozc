@@ -214,6 +214,187 @@ pub fn parse_rime_char_table(raw: &[u8]) -> Result<HanziTable> {
     Ok(map)
 }
 
+// ===========================================================================
+// OpenCC Traditional → Simplified normalization
+// ===========================================================================
+
+/// Traditional → Simplified converter built from the OpenCC `TSPhrases.txt`
+/// (phrase-level) and `TSCharacters.txt` (char-level) dictionaries.
+///
+/// Conversion applies the phrase map first (longest match at each position),
+/// then per-character mapping for any remaining (un-phrase-matched) characters.
+/// This mirrors how real simplified IMEs normalize their lexicon: 繁体 surfaces
+/// collapse onto their 简体 canonical form while the READING is left untouched.
+///
+/// For each OpenCC entry the FIRST value (space-separated) is taken as the
+/// canonical simplified form. Self-mapping entries (trad == simp) are dropped so
+/// `is_noop()`-style fast paths stay cheap and a word that is already simplified
+/// is returned unchanged.
+pub struct OpenCc {
+    /// trad char -> canonical simp char (only entries that actually change).
+    chars: FxHashMap<char, char>,
+    /// trad phrase -> canonical simp phrase (only entries that actually change).
+    phrases: FxHashMap<String, String>,
+    /// longest phrase key length in chars (0 if no phrases).
+    max_phrase_chars: usize,
+}
+
+impl OpenCc {
+    /// Build from raw OpenCC `TSCharacters.txt` and `TSPhrases.txt` bytes. Either
+    /// may be empty (e.g. download failed); conversion then degrades gracefully
+    /// (an empty converter is an identity map).
+    pub fn from_raw(ts_chars_raw: &[u8], ts_phrases_raw: &[u8]) -> Self {
+        let mut chars: FxHashMap<char, char> = FxHashMap::default();
+        let mut phrases: FxHashMap<String, String> = FxHashMap::default();
+        let mut max_phrase_chars = 0usize;
+
+        // Pass 0: collect the set of chars that appear as a canonical simplified
+        // VALUE (RHS first token of TSCharacters). OpenCC's TSCharacters is a
+        // *variant-folding* table, so some KEYS are themselves perfectly valid
+        // simplified characters (e.g. `坏→坯`); a real simplified IME must NOT fold
+        // those away. We treat any char that is a canonical simplified value as
+        // "simplified-valid" and refuse to convert it (or any phrase containing
+        // only such chars). This restricts conversion to genuinely traditional-only
+        // characters.
+        let mut simp_values: rustc_hash::FxHashSet<char> = rustc_hash::FxHashSet::default();
+        if let Ok(text) = std::str::from_utf8(ts_chars_raw) {
+            for line in text.lines() {
+                let line = line.trim_end_matches(['\r', '\n']);
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let vals = match line.split_once('\t') {
+                    Some((_, v)) => v,
+                    None => continue,
+                };
+                if let Some(c) = vals.split_whitespace().next().and_then(|v| v.chars().next()) {
+                    simp_values.insert(c);
+                }
+            }
+        }
+
+        // char-level: `trad<TAB>simp [alt...]`, single CJK char key.
+        if let Ok(text) = std::str::from_utf8(ts_chars_raw) {
+            for line in text.lines() {
+                let line = line.trim_end_matches(['\r', '\n']);
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let (key, vals) = match line.split_once('\t') {
+                    Some(x) => x,
+                    None => continue,
+                };
+                let mut kc = key.chars();
+                let (trad, second) = (kc.next(), kc.next());
+                let trad = match (trad, second) {
+                    (Some(c), None) => c,
+                    _ => continue, // not a single-char key
+                };
+                let simp = match vals.split_whitespace().next().and_then(|v| v.chars().next()) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                // Skip self-maps and keys that are themselves a canonical simplified
+                // character (those are NOT traditional-only; converting them mangles
+                // legitimate simplified text).
+                if trad != simp && !simp_values.contains(&trad) {
+                    chars.insert(trad, simp);
+                }
+            }
+        }
+
+        // phrase-level: `trad<TAB>simp [alt...]`, multi-char key.
+        if let Ok(text) = std::str::from_utf8(ts_phrases_raw) {
+            for line in text.lines() {
+                let line = line.trim_end_matches(['\r', '\n']);
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let (key, vals) = match line.split_once('\t') {
+                    Some(x) => x,
+                    None => continue,
+                };
+                let key = key.trim();
+                let simp = match vals.split_whitespace().next() {
+                    Some(v) => v.trim(),
+                    None => continue,
+                };
+                if key.is_empty() || simp.is_empty() || key == simp {
+                    continue;
+                }
+                // Only keep a phrase mapping if the KEY contains at least one
+                // genuinely-traditional char (one that is not itself a canonical
+                // simplified value). This skips variant-fold phrases whose key is
+                // already all-simplified (e.g. `坏子→坯子`), preventing mangling of
+                // legitimate simplified compounds.
+                let has_trad = key.chars().any(|c| !simp_values.contains(&c));
+                if !has_trad {
+                    continue;
+                }
+                let klen = key.chars().count();
+                if klen >= 1 {
+                    max_phrase_chars = max_phrase_chars.max(klen);
+                    phrases.insert(key.to_string(), simp.to_string());
+                }
+            }
+        }
+
+        OpenCc {
+            chars,
+            phrases,
+            max_phrase_chars,
+        }
+    }
+
+    /// Number of (changing) char + phrase mappings loaded.
+    pub fn len(&self) -> usize {
+        self.chars.len() + self.phrases.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chars.is_empty() && self.phrases.is_empty()
+    }
+
+    /// Convert a Traditional surface into Simplified: longest-match phrase
+    /// substitution first, then per-character mapping for the rest. Non-mapped
+    /// characters (including non-CJK) pass through unchanged. A fully-simplified
+    /// input is returned identical (modulo allocation).
+    pub fn convert(&self, s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < chars.len() {
+            // Try the longest phrase match starting at i.
+            let mut matched = false;
+            if self.max_phrase_chars >= 2 {
+                let upper = (i + self.max_phrase_chars).min(chars.len());
+                let mut j = upper;
+                while j > i + 1 {
+                    let cand: String = chars[i..j].iter().collect();
+                    if let Some(simp) = self.phrases.get(&cand) {
+                        out.push_str(simp);
+                        i = j;
+                        matched = true;
+                        break;
+                    }
+                    j -= 1;
+                }
+            }
+            if matched {
+                continue;
+            }
+            // Fall back to per-character mapping.
+            let c = chars[i];
+            match self.chars.get(&c) {
+                Some(&simp) => out.push(simp),
+                None => out.push(c),
+            }
+            i += 1;
+        }
+        out
+    }
+}
+
 /// Coarse part-of-speech tag → small u8 code (0 = generic). Just a few buckets.
 pub fn pos_tag(pos: &str) -> u8 {
     match pos.chars().next() {
