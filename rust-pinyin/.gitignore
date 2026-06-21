@@ -3,3 +3,4 @@
 **/*.rs.bk
 # Built data may be large; commit selectively. Default: ignore raw, allow built data/.
 /data/*.tmp
+/data.bak
