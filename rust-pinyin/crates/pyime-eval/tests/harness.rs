@@ -112,3 +112,79 @@ fn self_test_small_eval() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&out2);
 }
+
+/// The FAIR gold set (v2, correct word readings) must:
+///   * generate deterministically for a fixed seed,
+///   * read the polyphone 词组 银行 as `yinhang` (and never the bogus `yinxing`),
+///   * for a 词组 whose first-character reading is wrong out of context (系统: 系→`xi` in context,
+///     but `ji` as a bare per-char first reading), produce `xitong` — and so DIFFER from the
+///     per-character (v1) gold for that sentence.
+#[test]
+fn gold_v2_uses_correct_polyphone_readings() {
+    let Some(root) = workspace_root() else {
+        eprintln!("gold_v2_uses_correct_polyphone_readings: data/corpus not found, skipping");
+        return;
+    };
+    let data_dir = root.join("data");
+    let word_pinyin = data_dir.join("word_pinyin.tsv");
+    let hanzi = data_dir.join("hanzi_pinyin.tsv");
+    if !word_pinyin.exists() {
+        eprintln!("gold_v2: word_pinyin.tsv missing, skipping");
+        return;
+    }
+
+    // Tiny corpus with polyphone 词组. 银行 must read `yinhang`; 电脑系统 must read `...xitong`.
+    let pid = std::process::id();
+    let corpus = std::env::temp_dir().join(format!("pyime_gv2_corpus_{pid}.txt"));
+    std::fs::write(&corpus, "我去银行\n电脑系统\n").unwrap();
+
+    let v2 = std::env::temp_dir().join(format!("pyime_gv2_{pid}.jsonl"));
+    pyime_eval::generate_gold_correct_capped(&corpus, &word_pinyin, &hanzi, &v2, 7, 50)
+        .expect("generate v2");
+
+    // Determinism: same seed → byte-identical output.
+    let v2b = std::env::temp_dir().join(format!("pyime_gv2b_{pid}.jsonl"));
+    pyime_eval::generate_gold_correct_capped(&corpus, &word_pinyin, &hanzi, &v2b, 7, 50)
+        .expect("regenerate v2");
+    assert_eq!(
+        std::fs::read(&v2).unwrap(),
+        std::fs::read(&v2b).unwrap(),
+        "v2 gold generation must be deterministic for a fixed seed"
+    );
+
+    let cases = pyime_eval::gold::load(&v2).expect("load v2 gold");
+    let find_full = |expected: &str| {
+        cases
+            .iter()
+            .find(|c| c.bucket == "full" && c.expected == expected)
+            .unwrap_or_else(|| panic!("a `full` case for {expected}"))
+    };
+
+    // 银行 → yinhang, never yinxing.
+    let bank = find_full("我去银行");
+    assert!(bank.input.contains("yinhang"), "expected `yinhang` in {:?}", bank.input);
+    assert!(!bank.input.contains("yinxing"), "must not contain `yinxing` in {:?}", bank.input);
+
+    // 系统 → xitong (correct), not jitong (per-char 系→ji).
+    let sys = find_full("电脑系统");
+    assert!(sys.input.contains("xitong"), "expected `xitong` in {:?}", sys.input);
+    assert!(!sys.input.contains("jitong"), "must not contain per-char `jitong` in {:?}", sys.input);
+
+    // v2 (correct) must differ from v1 (per-char) for the 系统 sentence.
+    let v1 = std::env::temp_dir().join(format!("pyime_gv1_{pid}.jsonl"));
+    pyime_eval::generate_gold_capped(&corpus, &hanzi, &v1, 7, 50).expect("generate v1");
+    let v1_cases = pyime_eval::gold::load(&v1).expect("load v1 gold");
+    let v1_sys = v1_cases
+        .iter()
+        .find(|c| c.bucket == "full" && c.expected == "电脑系统")
+        .expect("v1 `full` case for 电脑系统");
+    assert_ne!(
+        v1_sys.input, sys.input,
+        "v2 (correct) and v1 (per-char) readings must differ for a polyphone sentence"
+    );
+    assert!(v1_sys.input.contains("jitong"), "v1 should mis-read as `jitong`: {:?}", v1_sys.input);
+
+    for p in [&corpus, &v2, &v2b, &v1] {
+        let _ = std::fs::remove_file(p);
+    }
+}

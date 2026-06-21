@@ -103,6 +103,34 @@ pub fn generate_gold_capped(
     gold::generate(corpus, hanzi_pinyin, out, seed, per_bucket)
 }
 
+/// Generate the FAIR gold set using correct word readings via longest-match tokenization over
+/// the curated lexicon (`word_pinyin.tsv`), falling back to the per-char `hanzi_pinyin.tsv`
+/// table for chars absent from the lexicon. Writes JSONL (e.g. `data/gold_v2.jsonl`) to `out`.
+///
+/// Unlike [`generate_gold`], this never mis-reads polyphones / 词组 (e.g. 提高→`tigao`,
+/// 系统→`xitong`, 重要→`zhongyao`), so the engine is scored on pinyin a user would actually type.
+pub fn generate_gold_correct(
+    corpus: &Path,
+    word_pinyin: &Path,
+    hanzi_pinyin: &Path,
+    out: &Path,
+    seed: u64,
+) -> Result<()> {
+    gold::generate_correct(corpus, word_pinyin, hanzi_pinyin, out, seed, 600)
+}
+
+/// Like [`generate_gold_correct`] but with an explicit per-bucket cap (used by tests).
+pub fn generate_gold_correct_capped(
+    corpus: &Path,
+    word_pinyin: &Path,
+    hanzi_pinyin: &Path,
+    out: &Path,
+    seed: u64,
+    per_bucket: usize,
+) -> Result<()> {
+    gold::generate_correct(corpus, word_pinyin, hanzi_pinyin, out, seed, per_bucket)
+}
+
 // ---------------------------------------------------------------------------
 // String comparison helpers
 // ---------------------------------------------------------------------------
