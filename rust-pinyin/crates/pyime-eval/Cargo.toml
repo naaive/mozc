@@ -1,0 +1,12 @@
+[package]
+name = "pyime-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pyime-core = { path = "../pyime-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true

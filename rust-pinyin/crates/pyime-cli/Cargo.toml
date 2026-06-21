@@ -1,0 +1,17 @@
+[package]
+name = "pyime-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pyime"
+path = "src/main.rs"
+
+[dependencies]
+pyime-core = { path = "../pyime-core" }
+pyime-eval = { path = "../pyime-eval" }
+pyime-data = { path = "../pyime-data" }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true

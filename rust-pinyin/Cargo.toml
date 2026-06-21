@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pyime-core",
+    "crates/pyime-data",
+    "crates/pyime-eval",
+    "crates/pyime-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fst = "0.4"
+memmap2 = "0.9"
+rkyv = { version = "0.7", features = ["validation"] }
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+zstd = "0.13"
+rustc-hash = "2"
+ureq = { version = "2", features = ["tls"] }
+flate2 = "1"
+indicatif = "0.17"
+
+# Build everything small & fast in release; keeps final binary well under budget.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

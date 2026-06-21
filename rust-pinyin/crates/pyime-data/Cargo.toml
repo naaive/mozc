@@ -1,0 +1,22 @@
+[package]
+name = "pyime-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pyime-core = { path = "../pyime-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+fst.workspace = true
+rkyv.workspace = true
+rustc-hash.workspace = true
+ureq.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+indicatif.workspace = true
+
+[[bin]]
+name = "build-data"
+path = "src/bin/build_data.rs"
