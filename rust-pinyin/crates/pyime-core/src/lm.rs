@@ -1,15 +1,29 @@
-//! Word unigram + bigram + (optional) trigram language model with stupid-backoff.
+//! Word unigram + bigram + (optional) trigram language model — **signed log-ratio** transitions
+//! with absolute-discounting smoothing (computed in pyime-data, consumed here).
 //!
-//! `bigram.fst` is an `fst::Map` keyed by `bigram_key(prev_id, id)` (8 bytes BE), value =
-//! bigram cost. `trigram.fst` (OPTIONAL — v2) is an `fst::Map` keyed by
-//! `trigram_key(w1, w2, w3)` (12 bytes BE), value = trigram cost. Missing n-grams back off to a
-//! fixed penalty plus the lower-order estimate so the decoder always has a transition cost.
+//! ## Cost convention (v3 — log-ratio over unigram)
+//! The decoder already adds `unigram_cost(w3)` ≈ `-500·ln P(w3)` as the word-edge cost. The LM
+//! transition is therefore the *bonus/penalty over the unigram*, on a single comparable scale:
+//!   * `transition_bigram(w2,w3)  = -500·ln[ P(w3|w2)    / P(w3) ]`
+//!   * `transition_trigram(w1,w2,w3) = -500·ln[ P(w3|w1,w2) / P(w3) ]`
+//! so `unigram_cost(w3) + transition = -500·ln P(w3|context)` — a proper conditional. The ratio
+//! can exceed 1 (context makes `w3` *more* likely), so transitions are **signed** (can be negative).
+//! The trigram now *refines* the bigram on the same scale instead of dwarfing it.
 //!
-//! Stupid-backoff transition (see DESIGN.md):
-//!   `cost(w3 | w1, w2)` = `trigram[(w1,w2,w3)]`                          if present
-//!                       = `TRIGRAM_BACKOFF + bigram[(w2,w3)]`            else if bigram present
-//!                       = `TRIGRAM_BACKOFF + BIGRAM_BACKOFF + unigram(w3)` otherwise.
-//! The 2-word case (sentence start / first transition) keeps using `transition_cost`.
+//! `P(·)` is estimated with absolute discounting + interpolation (D≈0.75) so rare n-grams do not
+//! overfit; the writer bakes the final signed costs into the FSTs.
+//!
+//! ## On-disk encoding
+//! `fst::Map` values are `u64`, but our costs are signed `i32`. We store `(cost + LM_COST_BIAS)` as
+//! a `u64` and recover `cost = stored - LM_COST_BIAS`. `LM_COST_BIAS` is large enough that every
+//! representable cost stays non-negative on disk.
+//!
+//! ## Backoff (signed)
+//!   `cost(w3 | w1, w2)` = `trigram[(w1,w2,w3)]`                         if present
+//!                       = `TRIGRAM_BACKOFF + bigram[(w2,w3)]`           else if bigram present
+//!                       = `TRIGRAM_BACKOFF + BIGRAM_BACKOFF`            otherwise
+//! (the unigram term lives on the word edge, so backoff is just the surcharge). The 2-word case
+//! (sentence start / first transition) uses `transition_cost`.
 
 use crate::consts::{BIGRAM_BACKOFF as CONST_BIGRAM_BACKOFF, TRIGRAM_BACKOFF as CONST_TRIGRAM_BACKOFF};
 use crate::format::{bigram_key, trigram_key};
@@ -18,11 +32,28 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;
 
-/// Backoff penalty (in LOG_BASE cost units) added when a bigram is absent. Kept as a re-export of
-/// the canonical `consts::BIGRAM_BACKOFF` for backwards compatibility with existing call sites.
-pub const BIGRAM_BACKOFF: u32 = CONST_BIGRAM_BACKOFF;
-/// Backoff penalty added when a trigram is absent (stupid-backoff). Mirror of `consts::TRIGRAM_BACKOFF`.
-pub const TRIGRAM_BACKOFF: u32 = CONST_TRIGRAM_BACKOFF;
+/// Signed backoff surcharge added when a bigram is absent. Re-export of `consts::BIGRAM_BACKOFF`.
+pub const BIGRAM_BACKOFF: i32 = CONST_BIGRAM_BACKOFF;
+/// Signed backoff surcharge added when a trigram is absent. Re-export of `consts::TRIGRAM_BACKOFF`.
+pub const TRIGRAM_BACKOFF: i32 = CONST_TRIGRAM_BACKOFF;
+
+/// Bias added to a signed transition cost before storing it as the (unsigned) `u64` FST value, and
+/// subtracted on read. MUST exceed the most-negative representable cost in magnitude. Shared with
+/// the data builder so writer and reader agree. `-500·ln(ratio)` for a strongly-boosted n-gram is
+/// at worst a few thousand negative; 1<<20 leaves enormous headroom and is trivially decodable.
+pub const LM_COST_BIAS: i64 = 1 << 20;
+
+/// Decode a stored FST value back into the signed cost it encodes.
+#[inline]
+pub fn decode_cost(stored: u64) -> i32 {
+    (stored as i64 - LM_COST_BIAS) as i32
+}
+
+/// Encode a signed cost into the `u64` FST value (used by the data builder via re-export).
+#[inline]
+pub fn encode_cost(cost: i32) -> u64 {
+    (cost as i64 + LM_COST_BIAS) as u64
+}
 
 /// Sentinel word id meaning "no word yet" (sentence start / before the first word). Matches the
 /// `u32::MAX` sentinel the decoder stores in `VNode.word_id` for the origin node, so the decoder
@@ -84,71 +115,64 @@ impl LanguageModel {
         self.trigram.is_some()
     }
 
-    /// Bigram cost for `(prev_id, id)`, or `None` if absent (caller applies backoff).
-    pub fn bigram_cost(&self, prev_id: u32, id: u32) -> Option<u32> {
+    /// Signed bigram transition cost for `(prev_id, id)`, or `None` if absent (caller applies
+    /// backoff). The stored FST value is the biased encoding of `-500·ln[P(id|prev)/P(id)]`.
+    pub fn bigram_cost(&self, prev_id: u32, id: u32) -> Option<i32> {
         let key = bigram_key(prev_id, id);
-        self.fst.get(key).map(|o| o.value() as u32)
+        self.fst.get(key).map(|o| decode_cost(o.value()))
     }
 
-    /// Trigram cost for `(w1, w2, w3)`, or `None` if absent / no trigram model loaded.
-    pub fn trigram_cost(&self, w1: u32, w2: u32, w3: u32) -> Option<u32> {
+    /// Signed trigram transition cost for `(w1, w2, w3)`, or `None` if absent / no trigram model.
+    pub fn trigram_cost(&self, w1: u32, w2: u32, w3: u32) -> Option<i32> {
         let tg = self.trigram.as_ref()?;
         let key = trigram_key(w1, w2, w3);
-        tg.fst.get(key).map(|o| o.value() as u32)
+        tg.fst.get(key).map(|o| decode_cost(o.value()))
     }
 
-    /// Bigram transition `cost(w3 | w2)` used as the stupid-backoff lower-order term: the bigram
-    /// cost if present, else a flat `BIGRAM_BACKOFF` penalty.
-    ///
-    /// NOTE on the unigram term: the DESIGN stupid-backoff formula writes the bigram-miss case as
-    /// `BIGRAM_BACKOFF + unigram_cost(w3)`. In THIS decoder the per-word unigram (reading) cost is
-    /// already added separately as the word-edge cost (`WordEdge.cost`), so re-adding it here would
-    /// double-count it and distort ranking. We therefore contribute only the `BIGRAM_BACKOFF`
-    /// surcharge — identical to the v1 `transition_cost` backoff — so the unigram-arrival total
-    /// (`edge.cost + BIGRAM_BACKOFF`) matches the spec while staying consistent with v1 behavior.
+    /// Bigram transition `cost(w3 | w2)` used as the lower-order term: the signed bigram log-ratio
+    /// cost if present, else a flat `BIGRAM_BACKOFF` surcharge. The unigram cost itself lives on the
+    /// word edge (`WordEdge.cost`), so this contributes ONLY the relative bonus/penalty — adding the
+    /// unigram here would double-count it.
     #[inline]
-    fn bigram_backoff_cost(&self, w2: u32, w3: u32, _unigram_w3: u32) -> u32 {
+    fn bigram_backoff_cost(&self, w2: u32, w3: u32) -> i32 {
         self.bigram_cost(w2, w3).unwrap_or(BIGRAM_BACKOFF)
     }
 
-    /// Transition cost from `prev` to `id`: bigram if present, else backoff penalty. Used for the
+    /// Transition cost from `prev` to `id`: bigram log-ratio if present, else backoff. Used for the
     /// 2-word case (sentence start / the first transition, where there is no `w_prevprev`).
-    pub fn transition_cost(&self, prev_id: Option<u32>, id: u32) -> u32 {
+    pub fn transition_cost(&self, prev_id: Option<u32>, id: u32) -> i32 {
         match prev_id {
             Some(p) => self.bigram_cost(p, id).unwrap_or(BIGRAM_BACKOFF),
             None => 0,
         }
     }
 
-    /// Stupid-backoff trigram transition cost `cost(w3 | w1, w2)`.
+    /// Signed log-ratio trigram transition cost `cost(w3 | w1, w2)` with backoff.
     ///
-    /// `unigram_w3` is the global unigram cost of `w3` (from its `WordEntry`), threaded in because
-    /// the LM does not own the words table. `w1` and/or `w2` may be `SENTENCE_START`:
-    ///   * `w2 == SENTENCE_START` means `w3` is the very first word — no history, cost 0.
-    ///   * `w1 == SENTENCE_START` (but `w2` real) means only one word of history exists, so this
-    ///     degrades to the bigram transition `cost(w3 | w2)` (no trigram lookup is possible).
-    pub fn transition_cost3(&self, w1: u32, w2: u32, w3: u32, unigram_w3: u32) -> u32 {
+    /// `_unigram_w3` is accepted for API stability (the log-ratio already factors the unigram out,
+    /// so it is no longer consulted here). `w1` and/or `w2` may be `SENTENCE_START`:
+    ///   * `w2 == SENTENCE_START` → `w3` is the very first word, no history, cost 0.
+    ///   * `w1 == SENTENCE_START` (but `w2` real) → only one word of history; use the bigram term.
+    pub fn transition_cost3(&self, w1: u32, w2: u32, w3: u32, _unigram_w3: u32) -> i32 {
         // No left context at all: first word of the sentence/run.
         if w2 == SENTENCE_START {
             return 0;
         }
         // Only one word of context: this is the second word, fall back to the bigram transition.
         if w1 == SENTENCE_START {
-            return self.bigram_backoff_cost(w2, w3, unigram_w3);
+            return self.bigram_backoff_cost(w2, w3);
         }
-        // No trigram model loaded at all (bigram-only data): reduce EXACTLY to the v1 bigram
-        // transition so the decoder does not regress when `trigram.fst` is absent. The
-        // `TRIGRAM_BACKOFF` surcharge only has meaning relative to *present* trigram entries, which
-        // do not exist without the file, so applying it here would only distort ranking vs the
-        // (transition-free) English edges.
+        // No trigram model loaded (bigram-only data): reduce EXACTLY to the bigram transition so the
+        // decoder does not regress when `trigram.fst` is absent (no TRIGRAM_BACKOFF surcharge — it
+        // only has meaning relative to *present* trigram entries).
         let Some(tg) = self.trigram.as_ref() else {
-            return self.bigram_backoff_cost(w2, w3, unigram_w3);
+            return self.bigram_backoff_cost(w2, w3);
         };
         // Full trigram context.
         if let Some(o) = tg.fst.get(trigram_key(w1, w2, w3)) {
-            return o.value() as u32;
+            return decode_cost(o.value());
         }
-        TRIGRAM_BACKOFF + self.bigram_backoff_cost(w2, w3, unigram_w3)
+        TRIGRAM_BACKOFF + self.bigram_backoff_cost(w2, w3)
     }
 }
 
@@ -172,7 +196,8 @@ mod tests {
         bg.sort_by(|a, b| bigram_key(a.0, a.1).cmp(&bigram_key(b.0, b.1)));
         let mut bb = fst::MapBuilder::memory();
         for (p, i, c) in &bg {
-            bb.insert(bigram_key(*p, *i), *c).unwrap();
+            // The fixtures express costs as plain (signed) values; store them with the on-disk bias.
+            bb.insert(bigram_key(*p, *i), encode_cost(*c as i32)).unwrap();
         }
         std::fs::write(dir.join("bigram.fst"), bb.into_inner().unwrap()).unwrap();
 
@@ -181,7 +206,7 @@ mod tests {
             tv.sort_by(|a, b| trigram_key(a.0, a.1, a.2).cmp(&trigram_key(b.0, b.1, b.2)));
             let mut tb = fst::MapBuilder::memory();
             for (a, b, c, cost) in &tv {
-                tb.insert(trigram_key(*a, *b, *c), *cost).unwrap();
+                tb.insert(trigram_key(*a, *b, *c), encode_cost(*cost as i32)).unwrap();
             }
             std::fs::write(dir.join("trigram.fst"), tb.into_inner().unwrap()).unwrap();
         }

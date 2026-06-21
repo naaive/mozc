@@ -24,17 +24,19 @@ pub mod consts {
     /// Penalty applied per English edge so clean pinyin segmentation wins.
     pub const ENGLISH_PEN: i32 = 3000;
 
-    /// Backoff penalty (in LOG_BASE cost units) added when a *bigram* is absent and the model
-    /// falls through to the unigram cost. Used by both the 2-word (`transition_cost`) and the
-    /// 3-word stupid-backoff (`transition_cost3`) transitions. (Relocated here from `lm.rs`; the
-    /// `lm::BIGRAM_BACKOFF` alias is kept for backwards compatibility.)
-    pub const BIGRAM_BACKOFF: u32 = 2400;
-    /// Backoff penalty added when a *trigram* `(w1,w2,w3)` is absent and the stupid-backoff model
-    /// falls through to the bigram (or unigram) estimate. Stupid-backoff multiplies P by a fixed
-    /// factor per backoff level; in additive log-cost space that is a constant surcharge. Tuned in
-    /// the 2000–3000 band so a present trigram is preferred but a missing one still ranks on its
-    /// bigram/unigram evidence.
-    pub const TRIGRAM_BACKOFF: u32 = 2600;
+    /// Backoff surcharge (in LOG_BASE cost units) added to the SIGNED log-ratio transition when a
+    /// *bigram* `(w2,w3)` is absent. With the interpolated log-ratio LM (see `lm.rs`), the stored
+    /// transition is `-500·ln[ P(w3|ctx) / P(w3) ]`; a missing bigram means the conditional reduces
+    /// to ~`λ(w2)·P(w3)`, i.e. the ratio is ~λ < 1, so the natural surcharge is `-500·ln λ`. λ is
+    /// typically 0.1–0.4, giving ~450–1150. We use a single representative value: the absence of a
+    /// bigram is mild evidence (the unigram cost is still paid on the edge), so it stays small.
+    pub const BIGRAM_BACKOFF: i32 = 700;
+    /// Backoff surcharge added when a *trigram* `(w1,w2,w3)` is absent and the model falls through
+    /// to the (signed) bigram log-ratio. With interpolation a trigram-miss reduces to essentially
+    /// the bigram estimate scaled by the trigram interpolation weight λ3, so the extra surcharge for
+    /// dropping one order is small. Kept low so a present trigram is preferred but a missing one
+    /// still ranks cleanly on its bigram evidence (no longer dwarfs the bigram scale).
+    pub const TRIGRAM_BACKOFF: i32 = 300;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

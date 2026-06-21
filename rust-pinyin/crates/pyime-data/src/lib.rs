@@ -48,20 +48,18 @@ pub fn prob_to_cost(prob: f64) -> u16 {
     }
 }
 
-/// u64 variant of [`prob_to_cost`] for LM (bigram/trigram) costs.
+/// SIGNED log-ratio LM cost: `round(-LOG_BASE · ln[ p_cond / p_uni ])`, clamped to
+/// `±LM_COST_CLAMP`. This is the bonus/penalty of the conditional over the unigram prior; the
+/// decoder adds it to the (separately-paid) unigram word-edge cost to recover `-LOG_BASE·ln p_cond`.
+/// Negative when context makes the word MORE likely than its prior (a genuine bonus).
 #[inline]
-fn prob_to_cost_u64(prob: f64) -> u64 {
-    if prob <= 0.0 {
-        return COST_MAX as u64;
+fn log_ratio_cost(p_cond: f64, p_uni: f64) -> i32 {
+    if p_cond <= 0.0 || p_uni <= 0.0 || !p_cond.is_finite() || !p_uni.is_finite() {
+        // Degenerate: no usable conditional signal -> neutral (defer to the unigram edge cost).
+        return 0;
     }
-    let c = (-LOG_BASE * prob.ln()).round();
-    if c <= 0.0 {
-        0
-    } else if c >= COST_MAX as f64 {
-        COST_MAX as u64
-    } else {
-        c as u64
-    }
+    let c = (-LOG_BASE * (p_cond / p_uni).ln()).round();
+    c.clamp(-(LM_COST_CLAMP as f64), LM_COST_CLAMP as f64) as i32
 }
 
 // ---------------------------------------------------------------------------
@@ -76,8 +74,22 @@ const MAX_ENGLISH: usize = 60_000;
 /// Drop word-bigram pairs observed fewer than this many times. With multiple
 /// large corpora, low-count pairs are mostly noise that displaces good candidates.
 const BIGRAM_MIN_COUNT: u32 = 5;
-/// Drop word-trigram triples observed fewer than this many times.
-const TRIGRAM_MIN_COUNT: u32 = 4;
+/// Drop word-trigram triples observed fewer than this many times. The absolute-discounting
+/// smoothing keeps rare triples from overfitting, so we can afford a moderate floor (raising it
+/// further only loses recall); the log-ratio formulation is what actually tames the noise.
+const TRIGRAM_MIN_COUNT: u32 = 8;
+
+/// Absolute-discounting constant `D` for the **bigram** model `P(w3|w2)`. Subtracted from each
+/// observed count; the freed mass is redistributed to the unigram via interpolation. ~0.75 is the
+/// standard Kneser-Ney/absolute-discounting value and works well empirically here.
+const BIGRAM_DISCOUNT: f64 = 0.75;
+/// Absolute-discounting constant `D` for the **trigram** model `P(w3|w1,w2)` (back-off to bigram).
+const TRIGRAM_DISCOUNT: f64 = 1.0;
+/// Clamp for the SIGNED log-ratio LM costs (transition = `-500·ln[P(w|ctx)/P(w)]`). The ratio is
+/// bounded both ways: a hugely-boosted n-gram cannot drop the path by more than this, and a
+/// suppressed one cannot inflate it past this. Keeps stored costs in a sane band and the beam
+/// well-behaved. ±12000 ≈ a probability ratio of e^24 ≈ 2.6e10, far beyond any real signal.
+const LM_COST_CLAMP: i32 = 12_000;
 /// Hard cap on the number of bigram pairs kept (highest-count first).
 const MAX_BIGRAMS: usize = 2_500_000;
 /// Hard cap on the number of trigram triples kept (highest-count first).
@@ -754,7 +766,41 @@ fn build_and_write_ngrams(
         }
     }
 
-    // --- bigram.fst ---------------------------------------------------------
+    // --- smoothing statistics ----------------------------------------------
+    // Absolute discounting + interpolation needs, besides the raw counts:
+    //   * total token count           -> unigram P(w) = c1(w)/total
+    //   * N1+(w2•)  = #distinct words following w2     (bigram continuation diversity)
+    //   * N1+(w1,w2•) = #distinct words following (w1,w2) (trigram continuation diversity)
+    // We derive the continuation-diversity maps from the *full* count tables (BEFORE min-count
+    // pruning) so the interpolation weights λ reflect the true distribution, not the pruned subset.
+    let total_tokens: f64 = uni_counts.values().map(|&c| c as f64).sum::<f64>().max(1.0);
+    let mut bi_distinct: FxHashMap<u32, u32> = FxHashMap::default(); // w2 -> #distinct w3
+    for &(w2, _w3) in bi_counts.keys() {
+        *bi_distinct.entry(w2).or_insert(0) += 1;
+    }
+    let mut tri_distinct: FxHashMap<(u32, u32), u32> = FxHashMap::default(); // (w1,w2) -> #distinct w3
+    for &(w1, w2, _w3) in tri_counts.keys() {
+        *tri_distinct.entry((w1, w2)).or_insert(0) += 1;
+    }
+
+    // Smoothed unigram probability P(w) = c1(w)/total.
+    let uni_p = |w: u32| -> f64 {
+        (*uni_counts.get(&w).unwrap_or(&0) as f64) / total_tokens
+    };
+    // Smoothed bigram P(w3|w2) = max(c2-D,0)/c1(w2) + λ(w2)·P(w3),
+    // with λ(w2) = D·N1+(w2•)/c1(w2). Falls back to the unigram when w2 is unseen.
+    let bi_p = |w2: u32, w3: u32, c2: f64| -> f64 {
+        let c_w2 = *uni_counts.get(&w2).unwrap_or(&0) as f64;
+        let p_uni = uni_p(w3);
+        if c_w2 <= 0.0 {
+            return p_uni;
+        }
+        let n1 = *bi_distinct.get(&w2).unwrap_or(&0) as f64;
+        let lambda = BIGRAM_DISCOUNT * n1 / c_w2;
+        ((c2 - BIGRAM_DISCOUNT).max(0.0)) / c_w2 + lambda * p_uni
+    };
+
+    // --- bigram.fst (signed log-ratio: -500·ln[P(w3|w2)/P(w3)]) -------------
     let mut pairs: Vec<((u32, u32), u32)> = bi_counts
         .iter()
         .filter(|&(_, &c)| c >= BIGRAM_MIN_COUNT)
@@ -773,18 +819,19 @@ fn build_and_write_ngrams(
         fst::MapBuilder::new(std::io::BufWriter::new(bigram_file)).context("bigram MapBuilder")?;
     let mut n_bigrams: u64 = 0;
     for &((prev, id), count) in &pairs {
-        // P(id | prev) = count(prev,id) / count(prev)
-        let denom = *uni_counts.get(&prev).unwrap_or(&0) as f64;
-        let prob = if denom > 0.0 { count as f64 / denom } else { 0.0 };
-        let cost = prob_to_cost_u64(prob);
-        bb.insert(pyime_core::format::bigram_key(prev, id), cost)
+        let p_cond = bi_p(prev, id, count as f64);
+        let p_uni = uni_p(id);
+        let cost = log_ratio_cost(p_cond, p_uni);
+        bb.insert(pyime_core::format::bigram_key(prev, id), pyime_core::lm::encode_cost(cost))
             .context("bigram insert")?;
         n_bigrams += 1;
     }
     bb.finish().context("bigram finish")?;
 
-    // --- trigram.fst --------------------------------------------------------
-    // trigram cost(w1,w2,w3) = -500*ln( count(w1,w2,w3) / count(w1,w2) ).
+    // --- trigram.fst (signed log-ratio: -500·ln[P(w3|w1,w2)/P(w3)]) --------
+    // P(w3|w1,w2) = max(c3-D,0)/c2(w1,w2) + λ(w1,w2)·P_bigram(w3|w2),
+    // with λ(w1,w2) = D·N1+(w1,w2•)/c2(w1,w2). The trigram thus *refines* the (already smoothed)
+    // bigram on the SAME log-ratio scale, instead of dwarfing it as the old raw-MLE cost did.
     let mut triples: Vec<((u32, u32, u32), u32)> = tri_counts
         .iter()
         .filter(|&(_, &c)| c >= TRIGRAM_MIN_COUNT)
@@ -806,10 +853,19 @@ fn build_and_write_ngrams(
         fst::MapBuilder::new(std::io::BufWriter::new(trigram_file)).context("trigram MapBuilder")?;
     let mut n_trigrams: u64 = 0;
     for &((w1, w2, w3), count) in &triples {
-        let denom = *bi_counts.get(&(w1, w2)).unwrap_or(&0) as f64;
-        let prob = if denom > 0.0 { count as f64 / denom } else { 0.0 };
-        let cost = prob_to_cost_u64(prob);
-        tb.insert(pyime_core::format::trigram_key(w1, w2, w3), cost)
+        let c2 = *bi_counts.get(&(w1, w2)).unwrap_or(&0) as f64;
+        // Lower-order term: the SMOOTHED bigram P(w3|w2) (uses the raw c2(w2,w3) count).
+        let p_bi = bi_p(w2, w3, *bi_counts.get(&(w2, w3)).unwrap_or(&0) as f64);
+        let p_cond = if c2 > 0.0 {
+            let n1 = *tri_distinct.get(&(w1, w2)).unwrap_or(&0) as f64;
+            let lambda = TRIGRAM_DISCOUNT * n1 / c2;
+            ((count as f64 - TRIGRAM_DISCOUNT).max(0.0)) / c2 + lambda * p_bi
+        } else {
+            p_bi
+        };
+        let p_uni = uni_p(w3);
+        let cost = log_ratio_cost(p_cond, p_uni);
+        tb.insert(pyime_core::format::trigram_key(w1, w2, w3), pyime_core::lm::encode_cost(cost))
             .context("trigram insert")?;
         n_trigrams += 1;
     }

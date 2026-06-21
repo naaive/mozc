@@ -579,13 +579,14 @@ fn beam_search(
                     arena[prev.prev].word_id
                 };
                 // English edges carry no language-model identity: no transition into them.
-                let trans = if we.word_id == ENGLISH_EDGE {
+                // `transition_cost3` is signed (log-ratio over unigram): it can be NEGATIVE when the
+                // context makes `we.word_id` more likely than its unigram prior, lowering the path.
+                let trans: i32 = if we.word_id == ENGLISH_EDGE {
                     0
                 } else {
                     engine
                         .lm
                         .transition_cost3(w_prevprev, w_prev, we.word_id, unigram_w3)
-                        as i32
                 };
                 let new_score = prev.score + we.cost + trans;
                 let node_idx = arena.len();
@@ -779,8 +780,8 @@ fn combine(engine: &Engine, lists: Vec<Vec<Partial>>, cfg: &EngineConfig) -> Vec
         for a in &acc {
             for b in &list {
                 // cross-chunk bigram transition between a's last word and b's first word.
-                let trans = match (a.last_word_id, b.first_word_id) {
-                    (Some(p), Some(first)) => engine.lm.transition_cost(Some(p), first) as i32,
+                let trans: i32 = match (a.last_word_id, b.first_word_id) {
+                    (Some(p), Some(first)) => engine.lm.transition_cost(Some(p), first),
                     _ => 0,
                 };
                 let kind = merge_kind(a.kind, b.kind, a.segments.is_empty(), b.segments.is_empty());
