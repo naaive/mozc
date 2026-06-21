@@ -32,6 +32,25 @@ pub struct WordMatch {
     pub end: usize,
     /// Accumulated edit cost from the lattice edges on this path.
     pub edit_cost: i32,
+    /// True if any abbreviation (initial-only) token was consumed on this match's path.
+    pub abbrev: bool,
+}
+
+/// Caps that bound dictionary matching (independent of decode history). Keeping these small is
+/// what makes the decoder fast: matching is memoized once per start position.
+mod caps {
+    /// Maximum recursion depth across `'` separators (number of dictionary syllables in one key).
+    pub const MAX_DEPTH: usize = 9;
+    /// Total node-visit budget per `match_from` call.
+    pub const NODE_BUDGET: u32 = 4_000;
+    /// Maximum FST children explored while completing a single abbreviation token. An initial may
+    /// fan out into many syllables; we keep only this many (the FST orders children, and the
+    /// downstream decoder keeps the cheapest words), which bounds abbrev blow-up.
+    pub const ABBREV_FANOUT: u32 = 64;
+    /// Maximum word ids kept per postings list (cheapest first) when emitting a match.
+    pub const POSTINGS_KEEP: usize = 8;
+    /// Maximum distinct matches collected per `match_from`.
+    pub const MAX_MATCHES: usize = 256;
 }
 
 pub struct Lexicon {
@@ -174,7 +193,7 @@ impl Lexicon {
     ) -> Vec<WordMatch> {
         let root = self.fst.root();
         let mut results = Vec::new();
-        let mut budget: u32 = 20_000; // node-visit budget to bound blowups
+        let mut budget: u32 = caps::NODE_BUDGET;
         self.walk(
             edges_from,
             start,
@@ -183,6 +202,7 @@ impl Lexicon {
             Output::zero(),
             0,
             0,
+            false,
             &mut results,
             &mut budget,
         );
@@ -199,10 +219,11 @@ impl Lexicon {
         out_acc: Output,
         edit_cost: i32,
         depth: usize,
+        abbrev: bool,
         results: &mut Vec<WordMatch>,
         budget: &mut u32,
     ) {
-        if depth > 12 || *budget == 0 {
+        if depth > caps::MAX_DEPTH || *budget == 0 || results.len() >= caps::MAX_MATCHES {
             return;
         }
 
@@ -215,8 +236,9 @@ impl Lexicon {
 
             if edge.abbrev {
                 // Initial-only token: follow the initial bytes, then any continuation up to the
-                // next separator (or word end). Enumerate via DFS over FST transitions.
+                // next separator (or word end). Enumerate via bounded DFS over FST transitions.
                 if let Some((after_init, acc1)) = self.follow_str(node, &edge.syllable, out_acc) {
+                    let mut fanout = caps::ABBREV_FANOUT;
                     self.expand_abbrev(
                         edges_from,
                         start,
@@ -227,14 +249,15 @@ impl Lexicon {
                         depth,
                         results,
                         budget,
+                        &mut fanout,
                     );
                 }
             } else {
                 // Exact syllable: follow its bytes.
                 if let Some((after_syl, acc1)) = self.follow_str(node, &edge.syllable, out_acc) {
                     self.emit_and_continue(
-                        edges_from, start, edge.end, after_syl, acc1, new_edit, depth, results,
-                        budget,
+                        edges_from, start, edge.end, after_syl, acc1, new_edit, depth, abbrev,
+                        results, budget,
                     );
                 }
             }
@@ -253,20 +276,27 @@ impl Lexicon {
         out_acc: Output,
         edit_cost: i32,
         depth: usize,
+        abbrev: bool,
         results: &mut Vec<WordMatch>,
         budget: &mut u32,
     ) {
         // (1) terminal key here?
         if node.is_final() {
             let final_out = out_acc.cat(node.final_output());
-            let postings = self.read_postings(final_out.value());
+            let mut postings = self.read_postings(final_out.value());
             if !postings.is_empty() {
+                // Keep only the cheapest few words per reading to bound downstream work.
+                if postings.len() > caps::POSTINGS_KEEP {
+                    postings.sort_unstable_by_key(|(_, c)| *c);
+                    postings.truncate(caps::POSTINGS_KEEP);
+                }
                 results.push(WordMatch {
                     words: postings,
                     n_syllables: 0, // (informational; not used downstream)
                     start,
                     end: pos,
                     edit_cost,
+                    abbrev,
                 });
             }
         }
@@ -274,8 +304,8 @@ impl Lexicon {
         if pos < edges_from.len() {
             if let Some((after_sep, acc_sep)) = self.step(&node, b'\'', out_acc) {
                 self.walk(
-                    edges_from, start, pos, after_sep, acc_sep, edit_cost, depth + 1, results,
-                    budget,
+                    edges_from, start, pos, after_sep, acc_sep, edit_cost, depth + 1, abbrev,
+                    results, budget,
                 );
             }
         }
@@ -283,7 +313,8 @@ impl Lexicon {
 
     /// Expand an abbreviation token: from `node` (positioned after the initial), follow any
     /// number of additional reading bytes until a `'` separator or word end, treating each as a
-    /// possible syllable completion. We DFS over FST transitions, stopping at `'`.
+    /// possible syllable completion. We DFS over FST transitions, stopping at `'`. `fanout` caps
+    /// how many FST children we visit so a single initial cannot explode into the whole subtree.
     #[allow(clippy::too_many_arguments)]
     fn expand_abbrev(
         &self,
@@ -296,27 +327,30 @@ impl Lexicon {
         depth: usize,
         results: &mut Vec<WordMatch>,
         budget: &mut u32,
+        fanout: &mut u32,
     ) {
         // The current node may already complete a syllable (e.g. initial "a"/"e" cases, or single
         // letter readings). Treat node as a syllable end here too.
         self.emit_and_continue(
-            edges_from, start, pos, node, out_acc, edit_cost, depth, results, budget,
+            edges_from, start, pos, node, out_acc, edit_cost, depth, true, results, budget,
         );
 
-        // Follow every non-separator transition deeper (still the *same* abbreviated syllable).
+        // Follow non-separator transitions deeper (still the *same* abbreviated syllable), but
+        // only up to the fanout cap. The FST orders children, giving a stable bounded subset.
         for ti in 0..node.len() {
-            *budget = budget.saturating_sub(1);
-            if *budget == 0 {
+            if *fanout == 0 || *budget == 0 {
                 return;
             }
             let t = node.transition(ti);
             if t.inp == b'\'' {
                 continue; // separator handled inside emit_and_continue
             }
+            *fanout -= 1;
+            *budget = budget.saturating_sub(1);
             let child = self.fst.node(t.addr);
             let acc = out_acc.cat(t.out);
             self.expand_abbrev(
-                edges_from, start, pos, child, acc, edit_cost, depth, results, budget,
+                edges_from, start, pos, child, acc, edit_cost, depth, results, budget, fanout,
             );
         }
     }

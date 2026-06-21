@@ -218,6 +218,31 @@ fn correction_syllables(letters: &str, start: usize, max_edits: u8) -> Vec<(Stri
 /// Cap on edges produced per start position (keeps expansion bounded).
 const MAX_EDGES_PER_POS: usize = 24;
 
+/// True if the normalized letters can be tiled *entirely* by exact canonical pinyin syllables
+/// (no fuzzy / typo / abbreviation), i.e. the whole run is "clean full pinyin". Used by the
+/// decoder to raise the English-passthrough penalty when a latin run also reads as real pinyin
+/// (so `nihao` → 你好 beats the literal `nihao`), while still letting `github`/`hello` pass.
+pub fn fully_segments(norm: &Normalized) -> bool {
+    let letters = norm.letters.as_bytes();
+    let n = letters.len();
+    if n == 0 {
+        return false;
+    }
+    // reachable[i] = letters[..i] is exactly tiled by canonical syllables.
+    let mut reachable = vec![false; n + 1];
+    reachable[0] = true;
+    for start in 0..n {
+        if !reachable[start] {
+            continue;
+        }
+        let rest = &norm.letters[start..];
+        for (_, len) in syllable::prefix_syllables(rest) {
+            reachable[start + len] = true;
+        }
+    }
+    reachable[n]
+}
+
 /// Build the syllable lattice over the normalized letters. Returns edges grouped by start
 /// position: `edges_from[i]` lists all edges leaving letter index `i`.
 pub fn build_lattice(norm: &Normalized, cfg: &EngineConfig) -> Vec<Vec<Edge>> {

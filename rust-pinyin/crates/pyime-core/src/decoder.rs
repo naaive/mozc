@@ -10,12 +10,22 @@
 //!      input candidates. `kind` is Chinese / English / Mixed depending on the chunks used.
 
 use crate::consts::ENGLISH_PEN;
-use crate::lexicon::WordMatch;
 use crate::segment::{self, Edge, Normalized};
 use crate::{Candidate, CandidateKind, Engine, EngineConfig, Segment};
 use rustc_hash::FxHashMap;
 
 const LITERAL_PASS_COST: i32 = 50; // tiny cost for literal CJK passthrough segments
+
+/// Per-letter English passthrough penalty (scales with run length so long latin runs that are
+/// really pinyin don't win by being "english").
+const ENGLISH_PER_CHAR_PEN: i32 = 220;
+/// Extra penalty when an out-of-vocabulary latin run *also* fully segments into clean pinyin
+/// (e.g. `nihao`, `zhongguo`): the Chinese reading should win, so push the literal passthrough
+/// well above any reasonable Chinese sentence cost — but keep it present as a survivor.
+const ENGLISH_FULLY_SEGMENTS_PEN: i32 = 9000;
+/// Penalty for an out-of-vocabulary latin run that is *not* a real English word and does not
+/// fully segment into pinyin (junk). Lower than the fully-segments case but still a clear band.
+const ENGLISH_OOV_PEN: i32 = 1500;
 
 /// A partial decoded result over one chunk (or the combined whole).
 #[derive(Clone)]
@@ -177,12 +187,19 @@ fn decode_latin(
     if cfg.enable_english {
         let lower = norm.letters.clone();
         let is_eng = engine.lexicon.is_english(&lower);
-        // Cost: english penalty scaled by letters; if it's in vocab, cheaper.
-        let base = ENGLISH_PEN;
+        let segments_clean = segment::fully_segments(&norm);
+        // Cost model (DESIGN.md): ENGLISH_PEN + PER_CHAR_PEN*run_len, reduced when the token is a
+        // real English word (in english.fst) so `github`/`hello` win, and raised when the run also
+        // fully segments into clean pinyin so `nihao`→你好 / `zhongguo`→中国 win.
+        let base = ENGLISH_PEN + ENGLISH_PER_CHAR_PEN * (lower.len() as i32);
         let eng_cost = if is_eng {
-            base
+            // Real English word: keep cheap. If it also happens to read as pinyin, nudge up a
+            // little but stay competitive (real words like `hello` are still wanted top-1).
+            base + if segments_clean { 600 } else { 0 }
+        } else if segments_clean {
+            base + ENGLISH_FULLY_SEGMENTS_PEN
         } else {
-            base + 1500 + (lower.len() as i32) * 200
+            base + ENGLISH_OOV_PEN
         };
         // reconstruct original-case surface from text (strip separators)
         let surface: String = text
