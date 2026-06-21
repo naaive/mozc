@@ -1,14 +1,24 @@
 //! pyime CLI — the user-facing command line for the Rust Pinyin IME engine.
 //!
 //! Subcommands:
-//!   interactive   — REPL: type pinyin, see ranked candidates (IME-style top-N)
+//!   interactive   — REPL: type pinyin, see ranked candidates, SELECT to commit/learn
 //!   convert       — one-shot convert of args/stdin (text or --json)
 //!   predict       — prefix prediction / completion
+//!   commit        — batch / scripted learning: record `input → chosen` selections
 //!   eval          — run pyime-eval against a gold set, print table (+ report.json)
 //!   build-data    — invoke the pyime-data build pipeline
 //!
 //! Default data dir: ./data (overridable with --data). Feature toggles map onto
 //! `EngineConfig` (fuzzy / correction / english / max-candidates).
+//!
+//! ## User dictionary / online adaptation (`--user`)
+//! The global `--user <PATH>` flag attaches a persistent user model (loaded from
+//! `PATH` if it exists, created otherwise). With it attached, selections made in
+//! `interactive` and rows fed to `commit` are *learned*: re-typing the same pinyin
+//! re-surfaces the committed candidate at/near #1, and the history persists across
+//! runs (saved to `PATH`). Without `--user`, behavior is byte-identical to before
+//! (no user model). `--no-learn` keeps the model loaded for inspection but sets
+//! `user_weight = 0`, disabling personalization at decode time.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -35,8 +45,30 @@ struct Cli {
     #[arg(long, global = true, default_value = "data")]
     data: PathBuf,
 
+    /// Persistent user-model path for online personalization. Loaded if it exists,
+    /// created on save otherwise. When set, `interactive` selections and `commit`
+    /// rows are learned and persisted; re-typing the same pinyin re-surfaces the
+    /// committed candidate. Omit for classic (no-user-model) behavior.
+    #[arg(long, global = true, value_name = "PATH")]
+    user: Option<PathBuf>,
+
+    /// Keep the user model loaded but disable personalization (user_weight = 0).
+    /// History is still recorded/saved on commit, just not used to re-rank.
+    #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
+    no_learn: bool,
+
     #[command(subcommand)]
     command: Command,
+}
+
+impl Cli {
+    /// Map the global `--no-learn` flag onto a config's `user_weight`.
+    fn apply_user_weight(&self, mut cfg: EngineConfig) -> EngineConfig {
+        if self.no_learn {
+            cfg.user_weight = 0;
+        }
+        cfg
+    }
 }
 
 #[derive(Subcommand)]
@@ -47,6 +79,8 @@ enum Command {
     Convert(ConvertArgs),
     /// Prefix prediction / completion for a partial input.
     Predict(PredictArgs),
+    /// Batch / scripted learning: record `input → chosen` commits into the user model.
+    Commit(CommitArgs),
     /// Evaluate the engine against a gold set and print a metrics table.
     Eval(EvalArgs),
     /// Build the data artifacts via the pyime-data pipeline.
@@ -126,6 +160,15 @@ struct PredictArgs {
 }
 
 #[derive(Args)]
+struct CommitArgs {
+    /// The pinyin input buffer that was typed (e.g. `beijing`).
+    /// Optional: if omitted, read `input<TAB>chosen` lines from stdin instead.
+    input: Option<String>,
+    /// The committed/chosen surface (e.g. `背景`). Required when `input` is given.
+    chosen: Option<String>,
+}
+
+#[derive(Args)]
 struct EvalArgs {
     /// Gold set path (JSONL). Auto-generated if missing.
     #[arg(long, default_value = "data/gold.jsonl")]
@@ -154,12 +197,13 @@ struct BuildDataArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Interactive(a) => cmd_interactive(&cli.data, &a),
-        Command::Convert(a) => cmd_convert(&cli.data, &a),
-        Command::Predict(a) => cmd_predict(&cli.data, &a),
-        Command::Eval(a) => cmd_eval(&cli.data, &a),
-        Command::BuildData(a) => cmd_build_data(&a),
+    match &cli.command {
+        Command::Interactive(a) => cmd_interactive(&cli, a),
+        Command::Convert(a) => cmd_convert(&cli, a),
+        Command::Predict(a) => cmd_predict(&cli, a),
+        Command::Commit(a) => cmd_commit(&cli, a),
+        Command::Eval(a) => cmd_eval(&cli.data, a),
+        Command::BuildData(a) => cmd_build_data(a),
     }
 }
 
@@ -177,6 +221,17 @@ fn load_engine(data_dir: &Path) -> Result<Engine> {
     }
     Engine::load(data_dir)
         .with_context(|| format!("loading engine data from '{}'", data_dir.display()))
+}
+
+/// Load the engine and, if `--user <PATH>` was given, attach the persistent user
+/// model from that path. Without `--user`, no user model is attached and behavior
+/// is identical to the classic engine.
+fn load_engine_with_user(cli: &Cli) -> Result<Engine> {
+    let engine = load_engine(&cli.data)?;
+    Ok(match &cli.user {
+        Some(path) => engine.with_user_model(Some(path.clone())),
+        None => engine,
+    })
 }
 
 fn kind_str(kind: CandidateKind) -> &'static str {
@@ -239,9 +294,9 @@ fn print_candidates<W: Write>(
 // convert
 // ===========================================================================
 
-fn cmd_convert(data_dir: &Path, args: &ConvertArgs) -> Result<()> {
-    let engine = load_engine(data_dir)?;
-    let cfg = args.features.apply(EngineConfig::default());
+fn cmd_convert(cli: &Cli, args: &ConvertArgs) -> Result<()> {
+    let engine = load_engine_with_user(cli)?;
+    let cfg = cli.apply_user_weight(args.features.apply(EngineConfig::default()));
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -278,9 +333,9 @@ fn cmd_convert(data_dir: &Path, args: &ConvertArgs) -> Result<()> {
 // predict
 // ===========================================================================
 
-fn cmd_predict(data_dir: &Path, args: &PredictArgs) -> Result<()> {
-    let engine = load_engine(data_dir)?;
-    let cfg = args.features.apply(EngineConfig::default());
+fn cmd_predict(cli: &Cli, args: &PredictArgs) -> Result<()> {
+    let engine = load_engine_with_user(cli)?;
+    let cfg = cli.apply_user_weight(args.features.apply(EngineConfig::default()));
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -314,28 +369,128 @@ fn cmd_predict(data_dir: &Path, args: &PredictArgs) -> Result<()> {
 }
 
 // ===========================================================================
+// commit (batch / scripted learning)
+// ===========================================================================
+
+/// `pyime --user <path> commit <input> <chosen>` records a single committed
+/// selection; with no positional args it reads `input<TAB>chosen` lines from stdin
+/// (blank lines and lines missing a tab are skipped). All commits are applied to
+/// the attached user model and persisted via `save_user`, then a summary is printed.
+///
+/// Requires `--user` to do anything useful: without it there is no model to persist
+/// (we still parse/validate input and report, but warn that nothing was saved).
+fn cmd_commit(cli: &Cli, args: &CommitArgs) -> Result<()> {
+    let engine = load_engine_with_user(cli)?;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    if cli.user.is_none() {
+        writeln!(
+            out,
+            "warning: no --user <PATH> set; commits are not persisted (nothing learned)."
+        )?;
+    }
+
+    let mut n = 0usize;
+    let mut apply = |input: &str, chosen: &str, out: &mut dyn Write| -> std::io::Result<()> {
+        let input = input.trim();
+        let chosen = chosen.trim();
+        if input.is_empty() || chosen.is_empty() {
+            return Ok(());
+        }
+        engine.commit(input, chosen);
+        n += 1;
+        writeln!(out, "  ✓ committed {} -> {}", input, chosen)
+    };
+
+    match (&args.input, &args.chosen) {
+        (Some(input), Some(chosen)) => {
+            apply(input, chosen, &mut out)?;
+        }
+        (Some(_), None) => {
+            anyhow::bail!("`commit <input> <chosen>` needs both arguments (got only <input>)");
+        }
+        (None, _) => {
+            // Read `input<TAB>chosen` lines from stdin.
+            for line in std::io::stdin().lock().lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match line.split_once('\t') {
+                    Some((input, chosen)) => apply(input, chosen, &mut out)?,
+                    None => writeln!(out, "  ! skipping (no TAB): {:?}", line)?,
+                }
+            }
+        }
+    }
+
+    engine.save_user().context("saving user model after commits")?;
+
+    match &cli.user {
+        Some(path) => writeln!(out, "committed {} selection(s); saved to {}", n, path.display())?,
+        None => writeln!(out, "committed {} selection(s) (not persisted: no --user)", n)?,
+    }
+    Ok(())
+}
+
+// ===========================================================================
 // interactive REPL
 // ===========================================================================
 
-fn cmd_interactive(data_dir: &Path, args: &InteractiveArgs) -> Result<()> {
-    let engine = load_engine(data_dir)?;
-    let mut cfg = args.features.apply(EngineConfig::default());
+/// Interactive REPL with a real IME "select-to-learn" loop.
+///
+/// ## Input protocol (line-oriented, robust to stdin piping)
+/// The REPL is a small state machine over input lines:
+///   * A **pinyin line** (anything that is not `:`-prefixed, not blank, and not a
+///     bare candidate number) decodes the input and prints the numbered candidate
+///     list. The decoded input + its candidates become the *pending selection*.
+///   * A bare **number** line `1`..`N` (1-based, within the shown top-N) while a
+///     selection is pending *commits* that candidate: it calls
+///     `engine.commit(input, chosen_text)`, prints `✓ committed <text>`, and (if a
+///     user model is attached) learns it. The pending selection is then cleared.
+///   * A **blank** line, or a number out of range, clears the pending selection and
+///     starts fresh (no commit).
+///   * `:`-prefixed lines are inline commands (see `handle_command`), plus:
+///       `:save`  persist the user model now (no-op without `--user`)
+///       `:q`     quit (persists automatically on exit when `--user` is set)
+///
+/// Effect: `printf 'beijing\n2\nbeijing\n:q\n'` selects candidate #2 for the first
+/// `beijing`, commits/learns it, then shows it promoted toward #1 on the second
+/// `beijing`. EOF behaves like `:q`.
+fn cmd_interactive(cli: &Cli, args: &InteractiveArgs) -> Result<()> {
+    let engine = load_engine_with_user(cli)?;
+    let mut cfg = cli.apply_user_weight(args.features.apply(EngineConfig::default()));
     let mut top = args.top.max(1);
+    let has_user = cli.user.is_some();
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
     writeln!(
         out,
-        "pyime interactive. Type pinyin and press Enter. Commands:\n  \
-         :q                quit\n  \
+        "pyime interactive. Type pinyin and press Enter, then a number to select.\n\
+         Commands:\n  \
+         <pinyin>          decode + show numbered candidates\n  \
+         <number>          select that candidate -> commit/learn it ('✓ committed ...')\n  \
+         <blank>           clear the pending selection (no commit)\n  \
+         :save             persist the user model now (needs --user)\n  \
+         :q                quit (auto-saves user model on exit when --user is set)\n  \
          :fuzzy on|off     toggle fuzzy syllables\n  \
          :correct on|off   toggle typo correction\n  \
          :english on|off   toggle English passthrough\n  \
          :n <k>            set max candidates shown"
     )?;
+    if has_user {
+        writeln!(out, "(user model attached: selections are learned and persisted)")?;
+    }
     write!(out, "> ")?;
     out.flush()?;
+
+    // Pending selection: the most recently decoded (input, candidates) awaiting a
+    // numeric pick. Cleared after a commit or a blank line.
+    let mut pending: Option<(String, Vec<Candidate>)> = None;
 
     for line in std::io::stdin().lock().lines() {
         let line = line?;
@@ -345,8 +500,18 @@ fn cmd_interactive(data_dir: &Path, args: &InteractiveArgs) -> Result<()> {
             break;
         }
 
-        // Inline command toggles.
+        // Inline command toggles + :save.
         if let Some(rest) = trimmed.strip_prefix(':') {
+            if rest.trim() == "save" {
+                match engine.save_user() {
+                    Ok(()) if has_user => writeln!(out, "  ✓ saved user model")?,
+                    Ok(()) => writeln!(out, "  (no --user set; nothing to save)")?,
+                    Err(e) => writeln!(out, "  ! save failed: {e}")?,
+                }
+                write!(out, "> ")?;
+                out.flush()?;
+                continue;
+            }
             match handle_command(rest, &mut cfg, &mut top) {
                 Ok(msg) => writeln!(out, "{}", msg)?,
                 Err(msg) => writeln!(out, "  ! {}", msg)?,
@@ -357,17 +522,53 @@ fn cmd_interactive(data_dir: &Path, args: &InteractiveArgs) -> Result<()> {
         }
 
         if trimmed.is_empty() {
+            // Blank line clears any pending selection.
+            pending = None;
             write!(out, "> ")?;
             out.flush()?;
             continue;
         }
 
+        // A bare number selects from the pending candidate list (1-based).
+        if let Ok(sel) = trimmed.parse::<usize>() {
+            if let Some((input, cands)) = pending.as_ref() {
+                let shown = cands.len().min(top);
+                if sel >= 1 && sel <= shown {
+                    let chosen = cands[sel - 1].text.clone();
+                    engine.commit(input, &chosen);
+                    writeln!(out, "  ✓ committed {}", chosen)?;
+                    pending = None;
+                    write!(out, "> ")?;
+                    out.flush()?;
+                    continue;
+                } else {
+                    writeln!(out, "  ! selection {} out of range (1..{})", sel, shown)?;
+                    pending = None;
+                    write!(out, "> ")?;
+                    out.flush()?;
+                    continue;
+                }
+            }
+            // No pending list: fall through and treat the number as a new input
+            // (it will simply decode to whatever the engine makes of it).
+        }
+
+        // Otherwise: a new pinyin input. Decode and show candidates.
         let cands = engine.convert(trimmed, &cfg);
         print_candidates(&mut out, &cands, top, true)?;
+        pending = Some((trimmed.to_string(), cands));
         write!(out, "> ")?;
         out.flush()?;
     }
 
+    // Persist on clean exit (EOF / :q) when a user model is attached.
+    if has_user {
+        if let Err(e) = engine.save_user() {
+            writeln!(out, "  ! save on exit failed: {e}")?;
+        } else {
+            writeln!(out, "  ✓ saved user model")?;
+        }
+    }
     writeln!(out, "\nbye.")?;
     Ok(())
 }
@@ -608,6 +809,95 @@ mod tests {
         assert_eq!(v["input"], "nihao");
         assert_eq!(v["candidates"][0]["text"], "你好");
         assert_eq!(v["candidates"][0]["kind"], "CN");
+    }
+
+    /// Helper: rank (1-based) of `want` among candidates for `input`, or None.
+    fn rank_of(cands: &[Candidate], want: &str) -> Option<usize> {
+        cands.iter().position(|c| c.text == want).map(|i| i + 1)
+    }
+
+    /// End-to-end select-to-learn: with a temp `--user` file and real data,
+    /// commit `beijing -> 背景` a few times and assert it gets promoted to #1.
+    #[test]
+    fn commit_promotes_candidate_with_user_model() {
+        let dir = data_dir();
+        if !dir.join("lexicon.fst").exists() {
+            eprintln!("(skipping: no built data at {})", dir.display());
+            return;
+        }
+
+        let user_path = std::env::temp_dir()
+            .join(format!("pyime_cli_user_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&user_path);
+
+        let cfg = EngineConfig::default();
+
+        // Baseline: load with a fresh (empty) user model, note 背景's rank.
+        let base_rank = {
+            let engine = load_engine(&dir)
+                .expect("load engine")
+                .with_user_model(Some(user_path.clone()));
+            let cands = engine.convert("beijing", &cfg);
+            let r = rank_of(&cands, "背景").expect("背景 should be a candidate for beijing");
+            assert!(r >= 1);
+            r
+        };
+
+        // Commit beijing -> 背景 several times, then persist.
+        {
+            let engine = load_engine(&dir)
+                .expect("load engine")
+                .with_user_model(Some(user_path.clone()));
+            for _ in 0..3 {
+                engine.commit("beijing", "背景");
+            }
+            engine.save_user().expect("save user model");
+        }
+        assert!(user_path.exists(), "user model should persist to {}", user_path.display());
+
+        // Reload (history must survive across runs) and re-convert.
+        {
+            let engine = load_engine(&dir)
+                .expect("load engine")
+                .with_user_model(Some(user_path.clone()));
+            let cands = engine.convert("beijing", &cfg);
+            let new_rank = rank_of(&cands, "背景").expect("背景 still a candidate");
+            assert_eq!(
+                new_rank, 1,
+                "背景 should be promoted to #1 after commits (was #{base_rank}, now #{new_rank})"
+            );
+        }
+
+        let _ = std::fs::remove_file(&user_path);
+    }
+
+    /// With `user_weight = 0` (the `--no-learn` effect), a learned model must NOT
+    /// re-rank: behavior is identical to no personalization.
+    #[test]
+    fn no_learn_disables_personalization() {
+        let dir = data_dir();
+        if !dir.join("lexicon.fst").exists() {
+            eprintln!("(skipping: no built data at {})", dir.display());
+            return;
+        }
+        let user_path = std::env::temp_dir()
+            .join(format!("pyime_cli_nolearn_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&user_path);
+
+        let engine = load_engine(&dir)
+            .expect("load engine")
+            .with_user_model(Some(user_path.clone()));
+        for _ in 0..3 {
+            engine.commit("beijing", "背景");
+        }
+
+        let mut cfg = EngineConfig::default();
+        cfg.user_weight = 0; // the --no-learn effect
+        let cands = engine.convert("beijing", &cfg);
+        // With personalization off, 北京 (the clean reading) should remain #1.
+        assert_eq!(cands[0].text, "北京", "user_weight=0 must not re-rank");
+
+        let _ = std::fs::remove_file(&user_path);
     }
 
     /// Real end-to-end conversion against the built data dir (skips if absent).
